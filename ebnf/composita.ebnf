@@ -1,0 +1,127 @@
+Program           := { Component | Interface }
+
+Component         := "COMPONENT" Identifier
+                     [ "OFFERS" InterfaceDeclList ]
+                     [ "REQUIRES" InterfaceDeclList ] ";"
+                       ComponentBody
+                     "END" Identifier ";".
+InterfaceDeclList := InterfaceDecl { "," InterfaceDecl }.
+InterfaceDecl     := Identifier [ "[" NofInterfaces "]" ].
+NofInterfaces     := Integer [ ".." ( Integer | "*" ) ].
+
+Interface         := "INTERFACE" Identifier ";"
+                       Protocol
+                     "END" Identifier ";".
+Protocol          := [ ProtocolExpression ].
+ProtocolExpr      := ProtocolTerm { "|" ProtocolTerm }.
+ProtocolTerm      := ProtocolFactor { ProtocolFactor }.
+ProtocolFactor    := MessageDecl
+                     | "[" ProtocolExpr "]"
+                     | "{" ProtocolExpr "}"
+                     | "(" ProtocolExpr ")".
+MessageDecl       := ( "IN" | "OUT" ) Identifier [ "(" ParameterList ")" ].
+ParameterList     := ParamSection { ";" ParamSection }.
+ParamSection      := IdentifierList ":" Type.
+
+ComponentBody     := { Declaration }
+                     { Implementation }
+                     [ "BEGIN" StatementSeq ]
+                     [ "ACTIVITY" StatementSeq ]
+                     [ "FINALLY" StatementSeq ].
+Declaration       := Component | Interface | ConstantList | VariableList | Procedure.
+ConstantList      := "CONSTANT" Constant { Constant }.
+Constant          := Identifier "=" ConstantExpr ";".
+VariableList      := "VARIABLE" VariableSection { VariableSection }.
+VariableSection   := IndexedIdentList ":" Type [ AttributeList ] ";".
+IndexedIdentList  := IndexedIdent { "," IndexedIdent }.
+IndexedIdent      := Identifier [ "[" ParameterList "]" ].
+Procedure         := "PROCEDURE" Identifer [ "(" [ ProcParamList ] ")" [ ":" Type ] ] ";"
+                     { Declaration }
+                     [ "BEGIN" StatementSeq ]
+                     "END" Identifier ";".
+ProcParamList     := ProcParSection { ";" ProcParSection }.
+ProcParSection    := [ "VARIABLE" ] ParamSection.
+
+Implementation    := "IMPLEMENTATION" Identifier ";"
+                       { Declaration }
+                       [ "BEGIN" StatementSeq ]
+                      "END" Identifier ";".
+
+Type              := Identifier | "ANY" [ "(" AnyInterfaceList ")" ].
+AnyInterfaceList  := [ InterfaceDeclList ] [ "|" InterfaceDeclList ].
+
+StatementSeq      := [ AttributeList ] StatementList.
+StatementList     := Statement { ";" Statement }.
+Statement         := (
+                       Assignment | New | Connect | Disconnect
+                       | Send | Receive | Delete | Move | Await | ProcedureCall | Return
+                       | If | While | Repeat | For | Foreach | StatementBlock
+                     ).
+Assignment        := Designator ":=" Expression.
+New               := "NEW" "(" Designatur [ "," Identifier ] ")".
+Connect           := "CONNECT" "(" Designatur "," Designatur ")".
+Disconnect        := "DISCONNECT" "(" Designatur ")".
+Send              := [ Designator ] "!" Identifier [ "(" ExpressionList ")" ].
+Receive           := [ Designatur ] "?" Identifier [ "(" DesignatorList ")" ].
+Delete            := "DELETE" "(" Designator ")".
+Move              := "MOVE" "(" Designator "," Designator ")".
+Await             := "AWAIT" "(" Expression ")".
+ProcedureCall     := Identifier [ "(" ExpressionList ")" ].
+Return            := "RETURN" [ Expression ].
+If                := "IF" Expression "THEN" StatementSeq
+                     { "ELSEIF" Expression "THEN" StatementSeq }
+                     [ "ELSE" StatementSeq ]
+While             := "WHILE" Expression "DO"
+                       StatementSeq
+                     "END".
+Repeat            := "REPEAT"
+                       StatementSeq
+                     "UNTIL" Expression.
+For               := "FOR" Designator ":=" Expression "TO" Expression [ "BY" ConstantExpr ] "DO"
+                       StatementSeq
+                     "END".
+Foreach           := "FOREACH" DesignatorList "OF" Designator "DO"
+                       StatementSeq
+                     "END".
+StatementBlock    := "BEGIN" StatementSeq "END".
+
+ExpressionList    := Expression { "," Expression }.
+ConstantExpr      := Expression.
+Expression        := [ AttributeList ]
+                     (
+                       SimpleExpr [ ( "=" | "#" | "<" | "<=" | ">" | ">=" ) ] SimpleExpr
+                       | Designator ( "OFFERS" | "REQUIRES" ) InterfaceDeclList
+                       | Designator "IS" "TYPE"
+                     ). 
+SimpleExpr        := [ "+" | "-" ] Term { ( "+" | "-" | "OR" ) Term }.
+Term              := Factor { ( "*" | "/" | "DIV" | "MOD" | "AND" ) Factor }.
+Factor            := Operand | "-" Factor | "(" Expression ")".
+Operand           := Number | ConstChar | Text | Designator
+                     | ReceiveTest | InputTest | ExistsTest
+                     | FunctionCall.
+ReceiveTest       := [ Designator ] "?" MessagePattern.
+InputTest         := "INPUT" "(" [ Designator "," ] MessagePattern ")".
+MessagePattern    := Identifier | "ANY" | "FINISH".
+ExistsTest        := "EXISTS" "(" Designator ")".
+FunctionCall      := Identifier "(" [ ExpressionList ] ")".
+
+DesignatorList    := Designator { "," Designator }.
+Designator        := Identifier
+                     | Identifier "[" ExpressionList "]"
+                     | Designator "(" Designator ")"
+                     | Designator "(" Type ")"
+
+AttributeList     := "{" IdentifierList "}".
+IdentifierList    := Identifier { "," Identifier }.
+Identifier        := Letter { Letter | Digit }.
+Letter            := "A" .. "Z" | "a" .. "z".
+Digit             := "0" .. "9".
+Number            := Integer | Real.
+Integer           := Digit { Digit } | Digit { HexDigit } "H".
+HexDigit          := Digit | "A" .. "F".
+Real              := Digit { Digit } "." { Digit } [ ScaleFactor ].
+ScaleFactor       := "E" [ "+" | "-" ] Digit { Digit }.
+ConstFactor       := """ Character """ | Digit { HexDigit } "X".
+Text              := """ { Character } """.
+Character         := (* any character except quotation mark *).
+
