@@ -1,0 +1,11 @@
+# Temporary files.
+*~
+*.swp
+
+# Xcode user data.
+xcuserdata
+
+# Folder metadata
+.DS_Store
+[Dd]esktop.ini
+
