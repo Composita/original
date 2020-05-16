@@ -58,11 +58,11 @@ Statement         := (
                        | If | While | Repeat | For | Foreach | StatementBlock
                      ).
 Assignment        := Designator ":=" Expression.
-New               := "NEW" "(" Designatur [ "," Identifier ] ")".
-Connect           := "CONNECT" "(" Designatur "," Designatur ")".
-Disconnect        := "DISCONNECT" "(" Designatur ")".
+New               := "NEW" "(" Designator [ "," Identifier ] ")".
+Connect           := "CONNECT" "(" Designator "," Designator ")".
+Disconnect        := "DISCONNECT" "(" Designator ")".
 Send              := [ Designator ] "!" Identifier [ "(" ExpressionList ")" ].
-Receive           := [ Designatur ] "?" Identifier [ "(" DesignatorList ")" ].
+Receive           := [ Designator ] "?" Identifier [ "(" DesignatorList ")" ].
 Delete            := "DELETE" "(" Designator ")".
 Move              := "MOVE" "(" Designator "," Designator ")".
 Await             := "AWAIT" "(" Expression ")".
