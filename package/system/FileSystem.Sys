@@ -1,0 +1,1721 @@
+MODULE ComFileSystem; (* Component System, File System, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, DiskDriver := ComDiskDriver, Concurrency, Output, Processors;
+	
+	(* File systen partly based on AOS and Oberon implementation *)
+
+	CONST 
+		Trace = TRUE;
+	
+		MaxVolumes* = 32;
+		MaxBuffers = 32; (* per file *)
+		
+		MinVolSize = 4;
+		SectorFactor = 29;
+		
+		(* WARNING: When the maximum length of filenames is changed, volumes must be re-formatted!!! *)
+		FileNameLength = 128; (* includes 0X *)
+
+		SectorTableSize = 128;
+		SectorSize = 4096;
+		IndexSize = SectorSize DIV 4;
+		DiskAdrSize = 4; (* bytes *)
+		
+		HeaderSize =  4 (* mark *) + FileNameLength + 4*4 (* aleng, bleng, time, date *) + (SectorTableSize+1)*DiskAdrSize;
+		
+		DirEntrySize = FileNameLength + 2*DiskAdrSize (* adr, p *);
+		DirPgHeaderSize = 2*4 (* mark, m *) + DiskAdrSize (* p0 *) + 4 (* min. FillerSize *);
+		DirPgSize = (SectorSize - DirPgHeaderSize) DIV DirEntrySize;	
+		FillerSize = (SectorSize - DirPgHeaderSize) MOD DirEntrySize + 4 (* min. FillerSize *);
+		
+		DirRootAdr = 1*SectorFactor;
+		N = DirPgSize DIV 2;
+		
+		DirectoryMark = 9B1EA38DH;
+		HeaderMark = 9BA71D86H;
+			
+		MapIndexSize = (SectorSize-4) DIV 4;
+		MapSize = SectorSize DIV 4;	(* {MapSize MOD 32 = 0} *)
+		MapMark = 9C2F977FH;
+		
+		InitHint = 200*SectorFactor;
+						
+		(* volume flags *)
+		ReadOnly = 0;
+		
+		BS = 512; (* device block size *)
+		CDBS = 2048; (* CD device block size *)
+		
+		SystemReserved = 32; (* reserved blocks for system on Boot volumes *)
+		
+		(* volume states *)
+		Closed = 0; Opening = 1; Opened = 2; Closing = 3;
+		
+	TYPE
+		Volume = POINTER TO RECORD
+			name-: VolumeName;
+			devId: LONGINT;
+			partNo: LONGINT;
+
+			size: LONGINT; (** size in blocks *)
+			blockSize: LONGINT; (* volume block size in bytes *)
+			blocks: LONGINT; (* device blocks per volume blocks *)
+			startfs: LONGINT; (* device block offset of file system start *)
+			flags: SET; (* ReadOnly *)
+					
+			map: AllocationTable;
+			used, reserved: LONGINT (* number of used and reserved blocks *)
+			
+			state: LONGINT; 
+			directory: Directory;
+			lastSectorReserved: BOOLEAN
+		END;
+		
+		Directory = RECORD
+			lastSectorReserved: BOOLEAN;
+		END;
+		
+		DiskSector = RECORD END;
+		DiskSectorArr = ARRAY SectorSize OF CHAR;
+		
+		DiskAdr = LONGINT;
+		FileName* = ARRAY FileNameLength OF CHAR;
+		SectorTable = ARRAY SectorTableSize OF DiskAdr;
+		
+		FileHeader = RECORD(DiskSector)
+			mark: LONGINT;
+			name: FileName;
+			aleng, bleng: LONGINT;
+			date, time: LONGINT;
+			sec: SectorTable;
+			ext: DiskAdr;
+			data: ARRAY SectorSize-HeaderSize OF CHAR
+		END;
+		
+		IndexSector = RECORD(DiskSector)
+			x: ARRAY IndexSize OF DiskAdr
+		END;
+	
+		DataSector = RECORD(DiskSector)
+			B: ARRAY SectorSize OF CHAR
+		END;
+	
+		DirectoryEntry = RECORD (*B-tree node*)
+			name: FileName;
+			adr: DiskAdr; (*sec no of file header*)
+			p: DiskAdr  (*sec no of descendant in directory*)
+		END;
+	
+		DirectoryPage = RECORD(DiskSector)
+			mark: LONGINT;
+			m: LONGINT;
+			p0: DiskAdr; (*sec no of left descendant in directory*)
+			fill: ARRAY FillerSize OF CHAR;
+			e: ARRAY DirPgSize OF DirectoryEntry
+		END;
+		
+		MapIndex = RECORD(DiskSector)
+			mark: LONGINT;
+			index: ARRAY MapIndexSize OF DiskAdr
+		END;
+				
+		MapSector = RECORD(DiskSector)
+			map: ARRAY MapSize OF SET
+		END;
+		
+		VolumeName* = ARRAY 32 OF CHAR;
+				
+		AllocationTable = POINTER TO ARRAY OF SET;
+		
+		VolumeList = ARRAY MaxVolumes OF Volume;
+		
+		File* = POINTER TO RECORD
+			id: LONGINT;
+			flags: SET; (* ReadOnly *)
+			key: LONGINT; 
+			volume: Volume;
+			aleng, bleng: LONGINT;
+			nofbufs: LONGINT;
+			modH, registered: BOOLEAN;
+			firstbuf: Buffer;
+			sechint: DiskAdr;
+			name: FileName;
+			time, date: LONGINT;
+			ext: SuperIndex;
+			sec: SectorTable
+		END;
+		
+		Buffer = POINTER TO RECORD
+			apos, lim: LONGINT;
+			mod: BOOLEAN;
+			next: Buffer;
+			data: DataSector
+		END;
+		
+		SuperIndex = POINTER TO RECORD
+			adr: DiskAdr;
+			mod: BOOLEAN;
+			sub: ARRAY IndexSize OF SubIndex
+		END;
+		
+		SubIndex = POINTER TO RECORD
+			adr: DiskAdr;
+			mod: BOOLEAN;
+			sec: IndexSector
+		END;
+		
+		FileList = POINTER TO ARRAY OF File;
+		
+		Rider* = RECORD
+			id: LONGINT;
+			pos: LONGINT;
+			eof: BOOLEAN;
+			apos, bpos: LONGINT
+		END;
+		
+		FileEntry* = RECORD
+			volume*: VolumeName;
+			name*: FileName;
+			size*: LONGINT;
+		END;
+		
+		FileEntryArray = POINTER TO ARRAY OF FileEntry;
+		
+		FileEntryList* = OBJECT
+			VAR 
+				list: FileEntryArray;
+				count: LONGINT;
+				
+			PROCEDURE &InitFileEntryList*;
+			BEGIN NEW(list, 8); count := 0
+			END InitFileEntryList;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(list)
+			END Free;
+		
+			PROCEDURE Length*(): LONGINT;
+			BEGIN RETURN count
+			END Length;
+			
+			PROCEDURE Grow;
+			VAR old: FileEntryArray; i: LONGINT;
+			BEGIN 
+				old := list; 
+				NEW(list, LEN(list)*2);
+				FOR i := 0 TO count-1 DO list[i] := old[i] END;
+				DELETE(old)
+			END Grow;
+			
+			PROCEDURE Add*(entry: FileEntry);
+			BEGIN
+				IF count = LEN(list) THEN Grow END;
+				list[count] := entry;
+				INC(count)
+			END Add;
+			
+			PROCEDURE Get*(i: LONGINT; VAR entry: FileEntry);
+			BEGIN
+				IF (i < 0) OR (i >= count) THEN HALT(101) END;
+				entry := list[i]
+			END Get;
+		END FileEntryList;
+		
+	VAR
+		initialized: BOOLEAN;
+		volumes: VolumeList;
+		default: Volume;
+		lock: Concurrency.WaitLock;
+		cdid: ARRAY 32 OF CHAR;
+		openFiles: FileList;
+		lastId: LONGINT;
+
+	PROCEDURE NewFile*(name: ARRAY OF CHAR; VAR r: Rider; VAR ok: BOOLEAN);
+	VAR f: File; volume: Volume;
+	BEGIN
+		Lock;
+		f := NIL;
+		volume := default;
+		IF ~IsOpenFile(volume, name) THEN
+			IF volume # NIL THEN f := InternalNewFile(volume, name) END
+		END;
+		IF f # NIL THEN 
+			r.id := f.id; InternalSetPos(r, f, 0); ok := TRUE
+		ELSE 
+			ok := FALSE
+		END;
+		Unlock
+	END NewFile;
+
+	PROCEDURE OpenFile*(name: ARRAY OF CHAR; VAR r: Rider; VAR ok: BOOLEAN);
+	VAR f: File; volume: Volume; i: LONGINT;
+	BEGIN
+		Lock;
+		f := NIL;
+		volume := default;
+		IF ~IsOpenFile(volume, name) THEN
+			IF volume # NIL THEN f := InternalOpenFile(volume, name) END
+		END;
+		IF (f = NIL) & (volume = default) THEN 
+			i := 0;
+			WHILE (i < LEN(volumes)) & (f = NIL) DO
+				volume := volumes[i];
+				IF (volume # NIL) & ~IsOpenFile(volume, name) THEN
+					f := InternalOpenFile(volume, name)
+				END;
+				INC(i)
+			END
+		END;
+		IF f # NIL THEN 
+			r.id := f.id; InternalSetPos(r, f, 0); ok := TRUE
+		ELSE 
+			ok := FALSE
+		END;
+		Unlock
+	END OpenFile;
+	
+	PROCEDURE CloseFile*(VAR r: Rider);
+	VAR f: File; 
+	BEGIN
+		Lock;
+		f := GetOpenFile(r);
+		IF f # NIL THEN
+			Unbuffer(f);
+			UnregisterOpenFile(f);
+			FreeFile(f);
+			r.id := 0; r.pos := 0; r.eof := TRUE
+		ELSE
+			IF Trace THEN Output.Text("File is not open"); Output.Line END
+		END;
+		Unlock
+	END CloseFile;
+	
+	PROCEDURE Update*(VAR r: Rider);
+	VAR f: File;
+	BEGIN
+		Lock;
+		f := GetOpenFile(r);
+		IF f # NIL THEN
+			Unbuffer(f)
+		ELSE
+			IF Trace THEN Output.Text("File is not opend"); Output.Line END
+		END;
+		Unlock
+	END Update;
+	
+	PROCEDURE SetPosition*(VAR r: Rider; pos: LONGINT);
+	VAR f: File;
+	BEGIN
+		Lock;
+		f := GetOpenFile(r);
+		IF f # NIL THEN
+			r.id := f.id;
+			InternalSetPos(r, f, pos)
+		ELSE
+			IF Trace THEN Output.Text("File is not opend"); Output.Line END
+		END;
+		Unlock
+	END SetPosition;
+	
+	PROCEDURE Read*(VAR r: Rider; VAR x: CHAR);
+	VAR f: File;
+	BEGIN
+		Lock;
+		f := GetOpenFile(r);
+		IF f # NIL THEN
+			InternalRead(r, x)
+		ELSE
+			x := 0X;
+			IF Trace THEN Output.Text("File is not opend"); Output.Line END
+		END;
+		Unlock
+	END Read;
+	
+	PROCEDURE Write*(VAR r: Rider; x: CHAR);
+	VAR f: File;
+	BEGIN
+		Lock;
+		f := GetOpenFile(r);
+		IF f # NIL THEN
+			InternalWrite(r, x)
+		ELSE
+			IF Trace THEN Output.Text("File is not opend"); Output.Line END
+		END;
+		Unlock
+	END Write;
+	
+	PROCEDURE EOF*(VAR r: Rider): BOOLEAN;
+	BEGIN RETURN r.eof
+	END EOF;
+	
+	PROCEDURE FileLength*(VAR r: Rider): LONGINT;
+	VAR f: File; l: LONGINT;
+	BEGIN
+		Lock;
+		f := GetOpenFile(r);
+		IF f # NIL THEN
+			l := InternalLength(f)
+		ELSE
+			l := 0;
+			IF Trace THEN Output.Text("File is not opend"); Output.Line END
+		END;
+		Unlock;
+		RETURN l
+	END FileLength;
+	
+	PROCEDURE Position*(VAR r: Rider): LONGINT;
+	BEGIN RETURN r.apos * SectorSize + r.bpos - HeaderSize
+	END Position;
+	
+	PROCEDURE GetDefaultVolume*(VAR name: ARRAY OF CHAR);
+	BEGIN 
+		Lock;
+		IF default # NIL THEN COPY(default.name, name) ELSE COPY("", name) END;
+		Unlock
+	END GetDefaultVolume;
+	
+	PROCEDURE SetDefaultVolume*(name: ARRAY OF CHAR);
+	VAR volume: Volume;
+	BEGIN
+		Lock;
+		volume := FindVolumeByName(name);
+		IF volume = NIL THEN
+			Output.Text("Volume "); Output.Text(name); Output.Text(" not loaded")
+		ELSE
+			InternalSetDefaultVolume(volume)
+		END;
+		Unlock
+	END SetDefaultVolume;
+	
+	PROCEDURE ListDirectory*(volumeName: ARRAY OF CHAR; withSizes: BOOLEAN): FileEntryList;
+	VAR volume: Volume; list: FileEntryList; continue: BOOLEAN;
+	BEGIN
+		Lock;
+		volume := FindVolumeByName(volumeName); 
+		IF volume # NIL THEN 
+			NEW(list); continue := TRUE;
+			InternalEnumerate(volume, DirRootAdr, withSizes, list, continue)
+		ELSE
+			list := NIL
+		END;
+		Unlock;
+		RETURN list
+	END ListDirectory;
+	
+	PROCEDURE ListVolumes*(VAR a: ARRAY OF VolumeName; VAR defaultName: VolumeName);
+	VAR i, k: LONGINT;
+	BEGIN
+		Lock;
+		k := 0;
+		FOR i := 0 TO LEN(volumes)-1 DO
+			IF volumes[i] # NIL THEN COPY(volumes[i].name, a[k]); INC(k) END
+		END;
+		WHILE k < LEN(a) DO COPY("", a[k]); INC(k) END;
+		IF default # NIL THEN COPY(default.name, defaultName) ELSE COPY("", defaultName) END;
+		Unlock
+	END ListVolumes;
+
+	PROCEDURE Mount*(volumeName: ARRAY OF CHAR);
+	VAR devId, partNo: LONGINT; prefix: VolumeName;
+	BEGIN
+		Lock;
+		SplitVolumeName(volumeName, prefix, devId, partNo);
+		IF (prefix = "IDE") & (devId >= 0) & (devId < LEN(DiskDriver.devices)) THEN
+			IF ~ExistsVolume(devId, partNo) THEN
+				InternalMountVolume(DiskDriver.devices[devId], partNo)
+			END
+		ELSE Output.Text("Invalid device"); Output.Line
+		END;
+		Unlock
+	END Mount;
+			
+	PROCEDURE Unmount*(volumeName: ARRAY OF CHAR);
+	VAR i: LONGINT;
+	BEGIN
+		Lock;
+		FOR i := 0 TO LEN(volumes)-1 DO
+			IF (volumes[i] # NIL) & (volumes[i].name = volumeName) THEN
+				InternalUnmountVolume(volumes[i])
+			END
+		END;
+		Unlock
+	END Unmount;
+	
+	PROCEDURE Cleanup*;
+	BEGIN
+		IF initialized THEN
+			Lock;
+			InternalCleanup;
+			Unlock
+		END
+	END Cleanup;
+	
+	PROCEDURE InternalCleanup;
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO LEN(volumes)-1 DO
+			IF volumes[i] # NIL THEN
+				InternalUnmountVolume(volumes[i])
+			END
+		END
+	END InternalCleanup;
+	
+	PROCEDURE FreeVolume(VAR volume: Volume);
+	BEGIN 
+		ASSERT(volume.state = Closed);
+		DELETE(volume.map); DELETE(volume)
+	END FreeVolume;
+	
+	PROCEDURE CleanupDirectory(volume: Volume);
+	VAR i, j, p, q, sec, size: LONGINT; mi: MapIndex; ms: MapSector;
+	BEGIN
+		volume.state := Closing;
+		size := volume.size; i := size * SectorFactor;
+		IF ~(ReadOnly IN volume.flags) THEN
+			IF volume.directory.lastSectorReserved THEN FreeSector(volume, i); volume.directory.lastSectorReserved := FALSE END;
+			IF ~Marked(volume, i) THEN (* last sector is available for us *)
+				j := 0; sec := 1; q := 0;
+				LOOP
+					REPEAT DEC(i, SectorFactor) UNTIL (i = 0) OR ~Marked(volume, i); (* find a free sector *)
+					IF i = 0 THEN RETURN END; (* no more space, don't commit *)
+					mi.index[j] := i; INC(j);
+					FOR p := 0 TO MapSize-1 DO ms.map[p] := {} END;
+					REPEAT
+						IF Marked(volume, sec * SectorFactor) THEN
+							INCL(ms.map[sec DIV 32 MOD MapSize], sec MOD 32);
+							INC(q)
+						END;
+						IF sec = size THEN
+							PutSector(volume, i, ms);
+							EXIT
+						END;
+						INC(sec)
+					UNTIL sec MOD (MapSize*32) = 0;
+					PutSector(volume, i, ms)
+				END;
+				WHILE j # MapIndexSize DO mi.index[j] := 0; INC(j) END;
+				mi.mark := MapMark;
+				PutSector(volume, size*SectorFactor, mi);	(* commit *)
+				IF Trace THEN Output.Text("DiskFS: Map saved on "); Output.Text(volume.name); Output.Line END
+			END
+		END;
+		volume.state := Closed
+	END CleanupDirectory;
+	
+	PROCEDURE InternalNewFile(volume: Volume; name: ARRAY OF CHAR): File;
+	VAR i: LONGINT; f: File; buf: Buffer; fh: FileHeader;
+	BEGIN
+		f := NIL; 
+		(* TODO: check name *)
+		NEW(buf); buf.apos := 0; buf.mod := TRUE; buf.lim := HeaderSize; buf.next := buf;
+		fh := SYSTEM.VAL(FileHeader, buf.data);
+		fh.mark := HeaderMark;
+		fh.aleng := 0; fh.bleng := HeaderSize; COPY(name, fh.name);
+		(* TODO: set time and date *)
+		fh.time := 0; fh.date := 0;
+		NEW(f); f.id := lastId; INC(lastId);
+		f.volume := volume; f.key := 0; 
+		f.aleng := 0; f.bleng := HeaderSize; f.modH := TRUE;
+		f.time := fh.time; f.date := fh.date;
+		f.firstbuf := buf; f.nofbufs := 1; COPY(name, f.name); f.sechint := InitHint;
+		f.registered := (f.name[0] = 0X);
+		f.ext := NIL; i := 0;
+		REPEAT f.sec[i] := 0; fh.sec[i] := 0; INC(i) UNTIL i = SectorTableSize;
+		InternalRegister(f);
+		RegisterOpenFile(f);
+		RETURN f
+	END InternalNewFile;
+	
+	PROCEDURE InternalRegister(f: File);
+	BEGIN
+		Unbuffer(f);
+		IF ~f.registered & (f.name # "") THEN
+			InsertOnVolume(f.volume, f.name, f.sec[0]);
+			f.registered := TRUE; f.key := f.sec[0]
+		ELSIF f.registered THEN	
+			IF Trace THEN Output.Text("File is already registered"); Output.Line END
+		ELSE
+			IF Trace THEN Output.Text("File has no name"); Output.Line END
+		END
+	END InternalRegister;
+	
+	PROCEDURE InternalLength(f: File): LONGINT;
+	BEGIN RETURN f.aleng * SectorSize + f.bleng - HeaderSize
+	END InternalLength;
+	
+	PROCEDURE InternalSetPos(VAR r: Rider; f: File; pos: LONGINT);
+	VAR a, b: LONGINT;
+	BEGIN
+		ASSERT(r.id = f.id); r.pos := pos; r.eof := FALSE;
+		IF pos < 0 THEN
+			a := 0; b := HeaderSize
+		ELSIF pos < f.aleng*SectorSize + f.bleng - HeaderSize THEN
+			a := (pos + HeaderSize) DIV SectorSize; b := (pos + HeaderSize) MOD SectorSize
+		ELSE
+			a := f.aleng; b := f.bleng
+		END;
+		r.apos := a; r.bpos := b
+	END InternalSetPos;
+	
+	PROCEDURE InternalRead(VAR r: Rider; VAR x: CHAR);
+	VAR f: File; buf: Buffer;
+	BEGIN
+		f := GetOpenFile(r); ASSERT(f # NIL);
+		buf := GetBuffer(f, r.apos);
+		IF r.bpos < buf.lim THEN
+			x := buf.data.B[r.bpos]; INC(r.bpos)
+		ELSIF r.apos < f.aleng THEN
+			INC(r.apos);
+			buf := SearchBuffer(f, r.apos);
+			IF buf = NIL THEN
+				buf := LastBuffer(f);
+				IF buf.mod THEN WriteBuffer(f, buf) END ;
+				ReadBuffer(f, buf, r.apos)
+			END;
+			ASSERT(buf.lim > 0);
+			x := buf.data.B[0]; r.bpos := 1
+		ELSE
+			x := 0X; r.eof := TRUE
+		END
+	END InternalRead;
+	
+	PROCEDURE InternalWrite(VAR r: Rider; x: CHAR);
+	VAR f: File; buf: Buffer;
+	BEGIN
+		f := GetOpenFile(r); ASSERT(f # NIL);
+		buf := GetBuffer(f, r.apos); 
+		IF r.bpos >= buf.lim THEN
+			IF r.bpos < SectorSize THEN
+				INC(buf.lim); INC(f.bleng); f.modH := TRUE
+			ELSE
+				WriteBuffer(f, buf); INC(r.apos); buf := SearchBuffer(f, r.apos);
+				IF buf = NIL THEN
+					buf := LastBuffer(f);
+					ASSERT(~buf.mod);
+					IF r.apos <= f.aleng THEN
+						ReadBuffer(f, buf, r.apos)
+					ELSE
+						buf.apos := r.apos; buf.lim := 1; INC(f.aleng); f.bleng := 1; f.modH := TRUE;
+						IF (f.aleng - SectorTableSize) MOD IndexSize = 0 THEN NewSub(f) END
+					END
+				END;
+				r.bpos := 0
+			END
+		END;
+		buf.data.B[r.bpos] := x; INC(r.bpos); buf.mod := TRUE
+	END InternalWrite;
+	
+	PROCEDURE InternalEnumerate(volume: Volume; dpg: DiskAdr; withSizes: BOOLEAN; 
+		list: FileEntryList; VAR continue: BOOLEAN);
+	VAR i, pos, diff: LONGINT; dpg1: DiskAdr; a: DirectoryPage; entry: FileEntry; fh: FileHeader;
+	BEGIN
+		GetSector(volume, dpg, a); i := 0;
+		WHILE (i < a.m) & continue DO
+			IF i = 0 THEN dpg1 := a.p0 ELSE dpg1 := a.e[i-1].p END;
+			IF diff >= 0 THEN (* matching prefix *)
+				IF dpg1 # 0 THEN InternalEnumerate(volume, dpg1, withSizes, list, continue) END;
+				IF diff = 0 THEN
+					IF continue THEN
+						IF withSizes THEN
+							GetSector(volume, a.e[i].adr, fh);
+							entry.size := fh.aleng*SectorSize + fh.bleng - HeaderSize
+						ELSE entry.size := 0
+						END;
+						COPY(volume.name, entry.volume);
+						COPY(a.e[i].name, entry.name);
+						list.Add(entry)
+					END
+				ELSE continue := FALSE
+				END
+			END;
+			INC(i)
+		END;
+		IF continue & (i > 0) & (a.e[i-1].p # 0) THEN
+			InternalEnumerate(volume, a.e[i-1].p, withSizes, list, continue)
+		END
+	END InternalEnumerate;
+	
+	PROCEDURE JoinName(volumeName, fileName: ARRAY OF CHAR; VAR result: ARRAY OF CHAR);
+	BEGIN COPY(volumeName, result); Append(result, ":"); Append(result, fileName)
+	END JoinName;
+		
+	PROCEDURE LastBuffer(f: File): Buffer;
+	VAR buf: Buffer;
+	BEGIN
+		IF f.firstbuf # NIL THEN 
+			buf := f.firstbuf;
+			WHILE buf.next # f.firstbuf DO buf := buf.next END;
+			RETURN buf
+		ELSE RETURN NIL
+		END
+	END LastBuffer;
+	
+	PROCEDURE GetBuffer(f: File; pos: LONGINT): Buffer;
+	VAR buf: Buffer;
+	BEGIN
+		buf := f.firstbuf;
+		LOOP
+			IF buf.apos = pos THEN EXIT END;
+			IF buf.next = f.firstbuf THEN
+				IF f.nofbufs < MaxBuffers THEN (* allocate new buffer *)
+					NEW(buf); buf.next := f.firstbuf.next; f.firstbuf.next := buf;
+					INC(f.nofbufs)
+				ELSE (* take one of the buffers *)
+					f.firstbuf := buf;
+					IF buf.mod THEN WriteBuffer(f, buf) END
+				END;
+				buf.apos := pos;
+				IF pos <= f.aleng THEN ReadBuffer(f, buf, pos) END;
+				EXIT
+			END;
+			buf := buf.next
+		END;
+		RETURN buf
+	END GetBuffer;
+	
+	PROCEDURE SearchBuffer(f: File; pos: LONGINT): Buffer;
+	VAR buf: Buffer;
+	BEGIN
+		buf := f.firstbuf;
+		LOOP
+			IF buf.apos = pos THEN EXIT END;
+			buf := buf.next;
+			IF buf = f.firstbuf THEN buf := NIL; EXIT END
+		END;
+		RETURN buf
+	END SearchBuffer;
+	
+	PROCEDURE ReadBuffer(f: File; buf: Buffer; pos: LONGINT);
+	VAR sec: DiskAdr; xpos: LONGINT;
+	BEGIN
+		IF pos < SectorTableSize THEN
+			sec := f.sec[pos]
+		ELSE
+			xpos := pos-SectorTableSize;
+			sec := f.ext.sub[xpos DIV IndexSize].sec.x[xpos MOD IndexSize]
+		END;
+		GetSector(f.volume, sec, buf.data);
+		IF pos < f.aleng THEN buf.lim := SectorSize ELSE buf.lim := f.bleng END;
+		buf.apos := pos; buf.mod := FALSE
+	END ReadBuffer;
+	
+	PROCEDURE WriteBuffer(f: File; buf: Buffer);
+	VAR i, k, xpos: LONGINT; secadr: DiskAdr; super: SuperIndex; sub: SubIndex;
+	BEGIN
+		(* TODO: set f.time and f.date *) 
+		f.modH := TRUE;
+		IF buf.apos < SectorTableSize THEN
+			secadr := f.sec[buf.apos];
+			IF secadr = 0 THEN
+				AllocSector(f.volume, f.sechint, secadr);
+				f.modH := TRUE; f.sec[buf.apos] := secadr; f.sechint := secadr
+			END;
+			IF buf.apos = 0 THEN
+				UpdateHeader(f, SYSTEM.VAL(FileHeader, buf.data)); f.modH := FALSE
+			END
+		ELSE
+			super := f.ext;
+			IF super = NIL THEN NewSuper(f); super := f.ext END;
+			xpos := buf.apos-SectorTableSize;
+			i := xpos DIV IndexSize; sub := super.sub[i];
+			IF sub = NIL THEN
+				NEW(sub); sub.adr := 0; sub.sec.x[0] := 0; super.sub[i] := sub; super.mod := TRUE
+			END;
+			k := xpos MOD IndexSize; secadr := sub.sec.x[k];
+			IF secadr = 0 THEN
+				AllocSector(f.volume, f.sechint, secadr); f.sechint := secadr;
+				sub.mod := TRUE; sub.sec.x[k] := secadr
+			END
+		END;
+		PutSector(f.volume, secadr, buf.data); buf.mod := FALSE
+	END WriteBuffer;
+	
+	PROCEDURE Unbuffer(f: File);
+	VAR i, k: LONGINT; buf: Buffer; super: SuperIndex; sub: SubIndex; head: FileHeader; sec: IndexSector; 
+	BEGIN
+		buf := f.firstbuf;
+		REPEAT
+			IF buf.mod THEN WriteBuffer(f, buf) END;
+			buf := buf.next
+		UNTIL buf = f.firstbuf;
+		super := f.ext;
+		IF super # NIL THEN
+			k := (f.aleng + (IndexSize-SectorTableSize)) DIV IndexSize; i := 0;
+			WHILE i # k DO
+				sub := super.sub[i]; INC(i);
+				IF sub.mod THEN
+					IF sub.adr = 0 THEN
+						AllocSector(f.volume, f.sechint, sub.adr); f.sechint := sub.adr;
+						super.mod := TRUE
+					END;
+					PutSector(f.volume, sub.adr, sub.sec); sub.mod := FALSE
+				END
+			END;
+			IF super.mod THEN
+				IF super.adr = 0 THEN
+					AllocSector(f.volume, f.sechint, super.adr); f.sechint := super.adr;
+					f.modH := TRUE
+				END;
+				i := 0;
+				WHILE i # k DO sec.x[i] := super.sub[i].adr; INC(i) END;
+				WHILE i # IndexSize DO sec.x[i] := 0; INC(i) END;
+				PutSector(f.volume, super.adr, sec); super.mod := FALSE
+			END
+		END;
+		IF f.modH THEN
+			GetSector(f.volume, f.sec[0], head); UpdateHeader(f, head);
+			PutSector(f.volume, f.sec[0], head); f.modH := FALSE
+		END
+	END Unbuffer;
+	
+	PROCEDURE UpdateHeader(f: File; VAR h: FileHeader);
+	BEGIN
+		h.aleng := f.aleng; h.bleng := f.bleng;
+		h.sec := f.sec;
+		IF f.ext # NIL THEN h.ext := f.ext.adr ELSE h.ext := 0 END;
+		h.date := f.date; h.time := f.time
+	END UpdateHeader;
+	
+	PROCEDURE NewSuper(f: File);
+	VAR i: LONGINT; super: SuperIndex;
+	BEGIN
+		NEW(super); super.adr := 0; super.mod := TRUE; f.modH := TRUE; f.ext := super;
+		FOR i := 0 TO IndexSize-1 DO super.sub[i] := NIL END
+	END NewSuper;
+	
+	PROCEDURE NewSub(f: File);
+	VAR i, k: LONGINT; sub: SubIndex;
+	BEGIN
+		k := (f.aleng - SectorTableSize) DIV IndexSize;
+		IF k = IndexSize THEN SYSTEM.HALT(18) END;
+		NEW(sub); sub.adr := 0; sub.mod := TRUE;
+		FOR i := 0 TO IndexSize-1 DO sub.sec.x[i] := 0 END;
+		IF f.ext = NIL THEN NewSuper(f) END;
+		f.ext.sub[k] := sub
+	END NewSub;
+	
+	PROCEDURE FreeFile(VAR file: File);
+	VAR buf: Buffer; i: LONGINT;
+	BEGIN
+		buf := LastBuffer(file);
+		buf.next := NIL;
+		WHILE file.firstbuf # NIL DO
+			buf := file.firstbuf; file.firstbuf := buf.next;
+			DELETE(buf)
+		END;
+		IF file.ext # NIL THEN
+			FOR i := 0 TO LEN(file.ext.sub)-1 DO
+				IF file.ext.sub[i] # NIL THEN DELETE(file.ext.sub[i]) END
+			END;
+			DELETE(file.ext)
+		END;
+		DELETE(file)
+	END FreeFile;
+		
+	PROCEDURE RegisterOpenFile(f: File);
+	VAR i, k: LONGINT; old: FileList;
+	BEGIN
+		i := 0; WHILE (i < LEN(openFiles)) & (openFiles[i] # NIL) DO INC(i) END;
+		IF i = LEN(openFiles) THEN
+			old := openFiles;
+			NEW(openFiles, LEN(old)*2);
+			FOR k := 0 TO LEN(old)-1 DO
+				openFiles[k] := old[k]
+			END;
+			DELETE(old)
+		END;
+		openFiles[i] := f
+	END RegisterOpenFile;
+	
+	PROCEDURE UnregisterOpenFile(f: File);
+	VAR i: LONGINT;
+	BEGIN
+		i := 0; WHILE (i < LEN(openFiles)) & (openFiles[i] # f) DO INC(i) END;
+		ASSERT(i < LEN(openFiles)); (* must be registered *)
+		openFiles[i] := NIL
+	END UnregisterOpenFile;
+	
+	PROCEDURE GetOpenFile(VAR r: Rider): File;
+	VAR i: LONGINT;
+	BEGIN
+		i := 0; WHILE (i < LEN(openFiles)) & ((openFiles[i] = NIL) OR (openFiles[i].id # r.id)) DO INC(i) END;
+		IF i = LEN(openFiles) THEN RETURN NIL ELSE RETURN openFiles[i] END
+	END GetOpenFile;
+	
+	PROCEDURE FindOpenFile(volume: Volume; name: ARRAY OF CHAR): File;
+	VAR i: LONGINT;
+	BEGIN
+		i := 0; 
+		WHILE (i < LEN(openFiles)) & 
+			((openFiles[i] = NIL) OR (openFiles[i].name # name) OR (openFiles[i].volume # volume)) DO INC(i) END;
+		IF i = LEN(openFiles) THEN RETURN NIL ELSE RETURN openFiles[i] END
+	END FindOpenFile;
+
+	PROCEDURE IsOpenFile(volume: Volume; name: ARRAY OF CHAR): BOOLEAN;
+	VAR f: File;
+	BEGIN f := FindOpenFile(volume, name); RETURN f # NIL
+	END IsOpenFile;
+	
+	PROCEDURE InternalOpenFile(volume: Volume; name: ARRAY OF CHAR): File;
+	VAR i, k: LONGINT; f: File; header: DiskAdr; buf: Buffer; fh: FileHeader;
+		super: SuperIndex; sub: SubIndex; sec: IndexSector;
+	BEGIN
+		f := NIL; 
+		ASSERT(~IsOpenFile(volume, name));
+		SearchOnVolume(volume, name, header);
+		IF header # 0 THEN
+			NEW(buf); buf.apos := 0; buf.next := buf; buf.mod := FALSE;
+			GetSector(volume, header, buf.data);
+			fh := SYSTEM.VAL(FileHeader, buf.data);
+			NEW(f); f.id := lastId; INC(lastId);
+			f.volume := volume; f.key := header;
+			f.aleng := fh.aleng; f.bleng := fh.bleng;
+			f.time := fh.time; f.date := fh.date;
+			IF f.aleng = 0 THEN buf.lim := f.bleng ELSE buf.lim := SectorSize END;
+			f.firstbuf := buf; f.nofbufs := 1;
+			COPY(name, f.name); f.registered := TRUE;
+			f.sec := fh.sec;
+			k := (f.aleng + (IndexSize-SectorTableSize)) DIV IndexSize;
+			IF k # 0 THEN
+				NEW(super); super.adr := fh.ext; super.mod := FALSE; f.ext := super;
+				GetSector(volume, super.adr, sec); i := 0;
+				WHILE i # k DO
+					NEW(sub); sub.adr := sec.x[i]; sub.mod := FALSE; super.sub[i] := sub;
+					GetSector(volume, sub.adr, sub.sec); INC(i)
+				END;
+				WHILE i # IndexSize DO super.sub[i] := NIL; INC(i) END
+			ELSE
+				f.ext := NIL
+			END;
+			f.sechint := header; f.modH := FALSE;
+			RegisterOpenFile(f)
+		END;
+		RETURN f
+	END InternalOpenFile;
+	
+	PROCEDURE InternalSetDefaultVolume(volume: Volume);
+	BEGIN
+		IF (volume # NIL) & (default # volume) THEN
+			Output.Text("Volume "); Output.Text(volume.name); Output.Text(" is default"); Output.Line
+		END;
+		default := volume
+	END InternalSetDefaultVolume;
+		
+	PROCEDURE FindVolume(devId, partNo: LONGINT): Volume;
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO LEN(volumes)-1 DO
+			IF (volumes[i] # NIL) & (volumes[i].devId = devId) & (volumes[i].partNo = partNo) THEN RETURN volumes[i] END
+		END;
+		RETURN NIL
+	END FindVolume;
+	
+	PROCEDURE FindVolumeByName(name: ARRAY OF CHAR): Volume;
+	VAR i: LONGINT;
+	BEGIN
+		i := 0; WHILE (i < LEN(volumes)) & ((volumes[i] = NIL) OR (volumes[i].name # name)) DO INC(i) END;
+		IF i < LEN(volumes) THEN RETURN volumes[i] ELSE RETURN NIL END
+	END FindVolumeByName;
+	
+	PROCEDURE ExistsVolume(devId, partNo: LONGINT): BOOLEAN;
+	VAR volume: Volume;
+	BEGIN volume := FindVolume(devId, partNo); RETURN volume # NIL
+	END ExistsVolume;
+	
+	PROCEDURE SplitVolumeName(name: ARRAY OF CHAR; VAR prefix: ARRAY OF CHAR; VAR devId, partNo: LONGINT);
+	VAR i: LONGINT;
+	BEGIN
+		i := 0; WHILE (i < LEN(name)) & (i < LEN(prefix)) & IsLetter(name[i]) DO prefix[i] := name[i]; INC(i) END;
+		IF i = LEN(name) THEN Output.Text("Too long device name"); Output.Line END;
+		IF i < LEN(prefix) THEN prefix[i] := 0X END;
+		ParseNumber(name, i, devId);
+		IF (i < LEN(name)) & (name[i] = "#") THEN 
+			INC(i); ParseNumber(name, i, partNo)
+		ELSE partNo := 0
+		END
+	END SplitVolumeName;
+	
+	PROCEDURE ParseNumber(name: ARRAY OF CHAR; VAR i: LONGINT; VAR n: LONGINT);
+	BEGIN
+		n := 0;
+		WHILE (i < LEN(name)) & IsDigit(name[i]) DO
+			n := n * 10 + (ORD(name[i]) - ORD("0")); INC(i)
+		END
+	END ParseNumber;
+	
+	PROCEDURE IsLetter(x: CHAR): BOOLEAN;
+	BEGIN RETURN ((x >= "A") & (x < "Z")) OR ((x >= "a") & (x <= "z"))
+	END IsLetter;
+	
+	PROCEDURE IsDigit(x: CHAR): BOOLEAN;
+	BEGIN RETURN (x >= "0") & (x <= "9")
+	END IsDigit;
+		
+	PROCEDURE LoadVolume(volume: Volume);
+	VAR fh: FileHeader;
+	BEGIN
+		IF (volume.blockSize = SectorSize) & (volume.size >= MinVolSize) THEN
+			GetSector(volume, DirRootAdr, fh);
+			IF fh.mark = DirectoryMark THEN
+				ASSERT(volume.size < MAX(LONGINT) DIV SectorFactor);
+				InitDirectory(volume);
+				ASSERT(volume.state = Opened);
+				Output.Text("Volume "); Output.Text(volume.name); Output.Text(" loaded"); Output.Line
+			ELSE
+				IF Trace THEN Output.Text("Invalid file system: root directory missing"); Output.Line END
+			END
+		ELSE
+			IF Trace THEN 
+			   Output.Text("Invalid volume size "); Output.Integer(volume.blockSize); 
+			   Output.Text(" "); Output.Integer(volume.size); Output.Line 
+			END
+		END
+	END LoadVolume;
+	
+	PROCEDURE InitDirectory(volume: Volume);
+	VAR files, k: LONGINT; bad: BOOLEAN; A: ARRAY 2000 OF DiskAdr;
+	BEGIN 
+		volume.lastSectorReserved := FALSE;
+		IF ~(ReadOnly IN volume.flags) THEN
+			volume.state := Opening; k := 0;
+			Startup(volume, files, k, bad);
+			IF volume.state # Opened THEN
+				files := 0;
+				IF Trace THEN Output.Text("Scanning "); Output.Text(volume.name); Output.Text("...") END;
+				TraverseDirectory(volume, A, files, k, bad, DirRootAdr);
+				MarkSectors(volume, A, files, k, bad);
+				IF Trace THEN Output.Text(" "); Output.Integer(files); Output.Text(" files"); Output.Line END;
+				volume.state := Opened
+			END;
+			IF ~Marked(volume, volume.size * SectorFactor) THEN (* last sector still free *)
+				MarkSector(volume, volume.size * SectorFactor); volume.lastSectorReserved := TRUE (* allocate it *)
+			END;
+			IF Trace THEN
+				Output.Integer(Available(volume) * (SectorSize DIV 1024));
+				Output.Text("KB of "); Output.Integer(volume.size * (SectorSize DIV 1024));
+				Output.Text("KB available on "); Output.Text(volume.name); Output.Line
+			END
+		ELSE
+			volume.state := Opened
+		END
+	END InitDirectory;
+	
+	PROCEDURE Startup(volume: Volume; VAR files, k: LONGINT; VAR bad: BOOLEAN);
+	VAR j, sec, size, q, free: LONGINT; mi: MapIndex; ms: MapSector;
+		s: ARRAY 10 OF CHAR; found: BOOLEAN;
+	BEGIN
+		size := volume.size; found := FALSE;
+		IF (Available(volume) = size) & (size # 0) THEN	(* all sectors available *)
+			GetSector(volume, size*SectorFactor, mi);
+			IF mi.mark = MapMark THEN
+				j := 0; (* check consistency of index *)
+				WHILE (j # MapIndexSize) & (mi.index[j] >= 0) & (mi.index[j] MOD SectorFactor = 0) DO INC(j) END;
+				IF j = MapIndexSize THEN
+					found := TRUE;
+					mi.mark := 0; PutSector(volume, size*SectorFactor, mi); (* invalidate index *)
+					j := 0; sec := 1; q := 0;
+					LOOP
+						IF (j = MapIndexSize) OR (mi.index[j] = 0) THEN EXIT END;
+						GetSector(volume, mi.index[j], ms);
+						REPEAT
+							IF (sec MOD 32) IN ms.map[sec DIV 32 MOD MapSize] THEN
+								MarkSector(volume, sec*SectorFactor);
+								INC(q)
+							END;
+							IF sec = size THEN EXIT END;
+							INC(sec)
+						UNTIL sec MOD (MapSize*32) = 0;
+						INC(j)
+					END;
+					ASSERT(q = size - Available(volume));
+					free := Available(volume) * 100 DIV size;
+					IF (Available(volume) * SectorSize > 100000H) THEN
+						volume.state := Opened
+					ELSE (* undo *)
+						FOR j := SectorFactor TO size*SectorFactor BY SectorFactor DO
+							IF Marked(volume, j) THEN FreeSector(volume, j) END
+						END;
+						ASSERT(Available(volume) = size);
+						IF Trace THEN
+							Output.Integer(free); Output.Text("% free, forcing disk GC on ");
+							Output.Text(volume.name); Output.Line
+						END
+					END
+				END
+			END;
+			IF ~found THEN
+				IF Trace THEN Output.Text("Index not found on "); Output.Text(volume.name); Output.Line END
+			END
+		END
+	END Startup;
+	
+	PROCEDURE TraverseDirectory(volume: Volume; VAR A: ARRAY OF DiskAdr; VAR files, k: LONGINT; VAR bad: BOOLEAN; 
+		dpg: DiskAdr);
+	VAR i: LONGINT; a: DirectoryPage;
+	BEGIN
+		GetSector(volume, dpg, a); MarkSector(volume, dpg); i := 0;
+		WHILE i < a.m DO
+			A[k] := a.e[i].adr;
+			INC(k); INC(i);
+			IF k = 2000 THEN MarkSectors(volume, A, files, k, bad); k := 0 END
+		END ;
+		IF a.p0 # 0 THEN
+			TraverseDirectory(volume, A, files, k, bad, a.p0); i := 0;
+			WHILE i < a.m DO
+				TraverseDirectory(volume, A, files, k, bad, a.e[i].p); INC(i)
+			END
+		END
+	END TraverseDirectory;
+	
+	PROCEDURE MarkSectors(volume: Volume; VAR A: ARRAY OF DiskAdr; VAR files, k: LONGINT; VAR bad: BOOLEAN);
+	VAR L, R, i, j, n: LONGINT; x: DiskAdr; hd: FileHeader; sup, sub: IndexSector;
+
+		PROCEDURE Sift(L, R: LONGINT);
+		VAR i, j: LONGINT; x: DiskAdr;
+		BEGIN j := L; x := A[j];
+			LOOP i := j; j := 2*j + 1;
+				IF (j+1 < R) & (A[j] < A[j+1]) THEN INC(j) END ;
+				IF (j >= R) OR (x > A[j]) THEN EXIT END ;
+				A[i] := A[j]
+			END ;
+			A[i] := x
+		END Sift;
+
+	BEGIN
+		IF Trace THEN Output.Text(" marking ... ") END;
+		L := k DIV 2; R := k; (* heapsort *)
+		WHILE L > 0 DO DEC(L); Sift(L, R) END ;
+		WHILE R > 0 DO
+			DEC(R); x := A[0]; A[0] := A[R]; A[R] := x; Sift(L, R)
+		END;
+		WHILE L < k DO
+			bad := FALSE; INC(files);
+			IF Trace & (files MOD 128 = 0) THEN Output.Text(".") END;
+			GetSector(volume, A[L], hd);
+			IF hd.aleng < SectorTableSize THEN
+				j := hd.aleng + 1;
+				REPEAT
+					DEC(j);
+					IF hd.sec[j] # 0 THEN MarkSector(volume, hd.sec[j]) ELSE hd.aleng := j-1; bad := TRUE END
+				UNTIL j = 0
+			ELSE
+				j := SectorTableSize;
+				REPEAT
+					DEC(j);
+					IF hd.sec[j] # 0 THEN MarkSector(volume, hd.sec[j]) ELSE hd.aleng := j-1; bad := TRUE END
+				UNTIL j = 0;
+				IF hd.ext = 0 THEN hd.aleng := SectorTableSize-1; bad := TRUE END;
+				IF ~bad THEN
+					MarkSector(volume, hd.ext); 
+					GetSector(volume, hd.ext, sup);
+					n := (hd.aleng - SectorTableSize) DIV IndexSize; i := 0;
+					WHILE (i <= n) & ~bad DO
+						IF sup.x[i] # 0 THEN
+							MarkSector(volume, sup.x[i]); 
+							GetSector(volume, sup.x[i], sub);
+							IF i < n THEN j := IndexSize
+							ELSE j := (hd.aleng - SectorTableSize) MOD IndexSize + 1
+							END;
+							REPEAT
+								DEC(j);
+								IF (sub.x[j] MOD SectorFactor = 0) & (sub.x[j] > 0) THEN
+									MarkSector(volume, sub.x[j])
+								ELSE bad := TRUE
+								END
+							UNTIL j = 0;
+							INC(i)
+						ELSE bad := TRUE
+						END;
+						IF bad THEN
+							IF i = 0 THEN hd.aleng := SectorTableSize-1
+							ELSE hd.aleng := SectorTableSize + (i-1) * IndexSize
+							END
+						END
+					END
+				END
+			END;
+			IF bad THEN
+				IF Trace THEN Output.Line; Output.Text(hd.name); Output.Text(" truncated") END;
+				hd.bleng := SectorSize; IF hd.aleng < 0 THEN hd.aleng := 0 (* really bad *) END;
+				PutSector(volume, A[L], hd)
+			END;
+			INC(L)
+		END;
+		IF Trace THEN Output.Text(" done"); Output.Line END
+	END MarkSectors;
+
+	PROCEDURE SearchOnVolume(volume: Volume; VAR name: ARRAY OF CHAR; VAR A: DiskAdr);
+	VAR i, L, R: LONGINT; dadr: DiskAdr; a: DirectoryPage;
+	BEGIN
+		ASSERT(volume.state = Opened);
+		dadr := DirRootAdr;
+		LOOP
+			GetSector(volume, dadr, a);
+			ASSERT(a.mark = DirectoryMark);
+			L := 0; R := a.m; (*binary search*)
+			WHILE L < R DO
+				i := (L+R) DIV 2;
+				IF name <= a.e[i].name THEN R := i ELSE L := i+1 END
+			END ;
+			IF (R < a.m) & (name = a.e[R].name) THEN
+				A := a.e[R].adr; EXIT (*found*)
+			END ;
+			IF R = 0 THEN dadr := a.p0 ELSE dadr := a.e[R-1].p END ;
+			IF dadr = 0 THEN A := 0; EXIT (* not present *) END
+		END
+	END SearchOnVolume;
+	
+	PROCEDURE InternalInsert(volume: Volume; VAR name: FileName; dpg0: DiskAdr; 
+		VAR h: BOOLEAN; VAR v: DirectoryEntry; fad: DiskAdr);
+	(* h means "B-tree has become higher and v is ascending element" *)
+	VAR ch: CHAR; i, j, L, R: LONGINT; dpg1: DiskAdr; u: DirectoryEntry; a: DirectoryPage;
+	BEGIN
+		ASSERT(volume.state = Opened);
+		GetSector(volume, dpg0, a);
+		L := 0; R := a.m; (* binary search *)
+		WHILE L < R DO
+			i := (L+R) DIV 2;
+			IF name <= a.e[i].name THEN R := i ELSE L := i+1 END
+		END ;
+		IF (R < a.m) & (name = a.e[R].name) THEN
+			a.e[R].adr := fad; PutSector(volume, dpg0, a)  (* replace *)
+		ELSE (* not on this page *)
+			IF R = 0 THEN dpg1 := a.p0 ELSE dpg1 := a.e[R-1].p END ;
+			IF dpg1 = 0 THEN (*not in tree, insert*)
+				u.adr := fad; u.p := 0; h := TRUE; j := 0;
+				REPEAT ch := name[j]; u.name[j] := ch; INC(j)
+				UNTIL ch = 0X;
+				WHILE j < FileNameLength DO u.name[j] := 0X; INC(j) END
+			ELSE
+				InternalInsert(volume, name, dpg1, h, u, fad)
+			END ;
+			IF h THEN (* insert u to the left of e[R] *)
+				IF a.m < DirPgSize THEN
+					h := FALSE; i := a.m;
+					WHILE i > R DO DEC(i); a.e[i+1] := a.e[i] END ;
+					a.e[R] := u; INC(a.m)
+				ELSE (* split page and assign the middle element to v *)
+					a.m := N; a.mark := DirectoryMark;
+					IF R < N THEN (*insert in left half*)
+						v := a.e[N-1]; i := N-1;
+						WHILE i > R DO DEC(i); a.e[i+1] := a.e[i] END ;
+						a.e[R] := u; PutSector(volume, dpg0, a);
+						AllocSector(volume, dpg0, dpg0); i := 0;
+						WHILE i < N DO a.e[i] := a.e[i+N]; INC(i) END
+					ELSE (* insert in right half *)
+						PutSector(volume, dpg0, a);
+						AllocSector(volume, dpg0, dpg0); DEC(R, N); i := 0;
+						IF R = 0 THEN v := u
+						ELSE v := a.e[N];
+							WHILE i < R-1 DO a.e[i] := a.e[N+1+i]; INC(i) END ;
+							a.e[i] := u; INC(i)
+						END ;
+						WHILE i < N DO a.e[i] := a.e[N+i]; INC(i) END
+					END ;
+					a.p0 := v.p; v.p := dpg0
+				END ;
+				PutSector(volume, dpg0, a)
+			END
+		END
+	END InternalInsert;
+
+	PROCEDURE InsertOnVolume(volume: Volume; VAR name: FileName; fad: DiskAdr);
+	VAR oldroot: DiskAdr; h: BOOLEAN; U: DirectoryEntry; a: DirectoryPage;
+	BEGIN
+		h := FALSE;
+		InternalInsert(volume, name, DirRootAdr, h, U, fad);
+		IF h THEN (* root overflow *)
+			GetSector(volume, DirRootAdr, a);
+			AllocSector(volume, DirRootAdr, oldroot); PutSector(volume, oldroot, a);
+			a.mark := DirectoryMark; a.m := 1; a.p0 := oldroot; a.e[0] := U;
+			PutSector(volume, DirRootAdr, a)
+		END
+	END InsertOnVolume;
+	
+	PROCEDURE PageUnderflow(volume: Volume; VAR c: DirectoryPage; (* ancestor page *) dpg0: DiskAdr; 
+		s: LONGINT; (* insertion point in c *) VAR h: BOOLEAN); (* c undersize *)
+	VAR i, k: LONGINT; dpg1: DiskAdr; a, b: DirectoryPage; (* a := underflowing page, b := neighbouring page *)
+	BEGIN
+		GetSector(volume, dpg0, a);
+		(* h & a.m = N-1 & dpg0 = c.e[s-1].p *)
+		IF s < c.m THEN (* b := page to the right of a *)
+			dpg1 := c.e[s].p; GetSector(volume, dpg1, b);
+			k := (b.m-N+1) DIV 2; (* k = no. of items available on page b *)
+			a.e[N-1] := c.e[s]; a.e[N-1].p := b.p0;
+			IF k > 0 THEN
+				(* move k-1 items from b to a, one to c *) i := 0;
+				WHILE i < k-1 DO a.e[i+N] := b.e[i]; INC(i) END ;
+				c.e[s] := b.e[i]; b.p0 := c.e[s].p;
+				c.e[s].p := dpg1; DEC(b.m, k); i := 0;
+				WHILE i < b.m DO b.e[i] := b.e[i+k]; INC(i) END ;
+				PutSector(volume, dpg1, b); a.m := N-1+k; h := FALSE
+			ELSE (* merge pages a and b, discard b *) i := 0;
+				WHILE i < N DO a.e[i+N] := b.e[i]; INC(i) END ;
+				i := s; DEC(c.m);
+				WHILE i < c.m DO c.e[i] := c.e[i+1]; INC(i) END ;
+				a.m := 2*N; h := c.m < N;
+				FreeSector(volume, dpg1) (* free b *)
+			END ;
+			PutSector(volume, dpg0, a)
+		ELSE (* b := page to the left of a *) DEC(s);
+			IF s = 0 THEN dpg1 := c.p0 ELSE dpg1 := c.e[s-1].p END ;
+			GetSector(volume, dpg1, b);
+			k := (b.m-N+1) DIV 2; (* k = no. of items available on page b *)
+			IF k > 0 THEN
+				i := N-1;
+				WHILE i > 0 DO DEC(i); a.e[i+k] := a.e[i] END ;
+				i := k-1; a.e[i] := c.e[s]; a.e[i].p := a.p0;
+				(*move k-1 items from b to a, one to c*) DEC(b.m, k);
+				WHILE i > 0 DO DEC(i); a.e[i] := b.e[i+b.m+1] END ;
+				c.e[s] := b.e[b.m]; a.p0 := c.e[s].p;
+				c.e[s].p := dpg0; a.m := N-1+k; h := FALSE;
+				PutSector(volume, dpg0, a)
+			ELSE (*merge pages a and b, discard a*)
+				c.e[s].p := a.p0; b.e[N] := c.e[s]; i := 0;
+				WHILE i < N-1 DO b.e[i+N+1] := a.e[i]; INC(i) END ;
+				b.m := 2*N; DEC(c.m); h := c.m < N;
+				FreeSector(volume, dpg0) (* free a *)
+			END ;
+			PutSector(volume, dpg1, b)
+		END
+	END PageUnderflow;
+
+	PROCEDURE InternalDelete(volume: Volume; VAR name: FileName; dpg0: DiskAdr; VAR h: BOOLEAN; VAR fad: DiskAdr);
+	(* search and delete entry with key name; if a page underflow arises,
+		balance with adjacent page or merge; h means "page dpg0 is undersize" *)
+	VAR i, L, R: LONGINT; dpg1: DiskAdr; a: DirectoryPage;
+	
+		PROCEDURE del(dpg1: DiskAdr; VAR h: BOOLEAN);
+			VAR dpg2: DiskAdr; (* global: a, R *) b: DirectoryPage;
+		BEGIN
+			GetSector(volume, dpg1, b); dpg2 := b.e[b.m-1].p;
+			IF dpg2 # 0 THEN del(dpg2, h);
+				IF h THEN PageUnderflow(volume, b, dpg2, b.m, h); PutSector(volume, dpg1, b) END
+			ELSE
+				b.e[b.m-1].p := a.e[R].p; a.e[R] := b.e[b.m-1];
+				DEC(b.m); h := b.m < N; PutSector(volume, dpg1, b)
+			END
+		END del;
+		
+	BEGIN
+		ASSERT(volume.state = Opened);
+		GetSector(volume, dpg0, a);
+		L := 0; R := a.m; (*binary search*)
+		WHILE L < R DO
+			i := (L+R) DIV 2;
+			IF name <= a.e[i].name THEN R := i ELSE L := i+1 END
+		END ;
+		IF R = 0 THEN dpg1 := a.p0 ELSE dpg1 := a.e[R-1].p END ;
+		IF (R < a.m) & (name = a.e[R].name) THEN
+			(* found, now delete *) fad := a.e[R].adr;
+			IF dpg1 = 0 THEN  (*a is a leaf page*)
+				DEC(a.m); h := a.m < N; i := R;
+				WHILE i < a.m DO a.e[i] := a.e[i+1]; INC(i) END
+			ELSE del(dpg1, h);
+				IF h THEN PageUnderflow(volume, a, dpg1, R, h) END
+			END ;
+			PutSector(volume, dpg0, a)
+		ELSIF dpg1 # 0 THEN
+			InternalDelete(volume, name, dpg1, h, fad);
+			IF h THEN PageUnderflow(volume, a, dpg1, R, h); PutSector(volume, dpg0, a) END
+		ELSE (* not in tree *) fad := 0
+		END
+	END InternalDelete;
+
+	PROCEDURE DeleteOnVolume(volume: Volume; VAR name: FileName; VAR fad: DiskAdr);
+	VAR h: BOOLEAN; newroot: DiskAdr; a: DirectoryPage;
+	BEGIN
+		h := FALSE;
+		InternalDelete(volume, name, DirRootAdr, h, fad);
+		IF h THEN (* root underflow *)
+			GetSector(volume, DirRootAdr, a);
+			IF (a.m = 0) & (a.p0 # 0) THEN
+				newroot := a.p0; GetSector(volume, newroot, a);
+				PutSector(volume, DirRootAdr, a); (* discard newroot *)
+				FreeSector(volume, newroot)
+			END
+		END
+	END DeleteOnVolume;
+
+	PROCEDURE Available(volume: Volume): LONGINT;
+	BEGIN RETURN volume.size - volume.used
+	END Available;
+	
+	PROCEDURE GetSector(volume: Volume; src: DiskAdr; VAR dest: DiskSector);
+	BEGIN
+		IF src MOD SectorFactor # 0 THEN SYSTEM.HALT(15) END;
+		GetBlock(volume, src DIV SectorFactor, SYSTEM.VAL(DiskSectorArr, dest))
+	END GetSector;
+	
+	PROCEDURE PutSector(volume: Volume; dest: DiskAdr; VAR src: DiskSector);
+	BEGIN
+		ASSERT(~(ReadOnly IN volume.flags));
+		IF dest MOD SectorFactor # 0 THEN SYSTEM.HALT(15) END;
+		PutBlock(volume, dest DIV SectorFactor, SYSTEM.VAL(DiskSectorArr, src))
+	END PutSector;
+	
+	PROCEDURE AllocSector(volume: Volume; hint: DiskAdr; VAR sec: DiskAdr);
+	BEGIN
+		ASSERT(~(ReadOnly IN volume.flags));
+		AllocBlock(volume, hint DIV SectorFactor, sec);
+		sec := sec * SectorFactor
+	END AllocSector;
+	
+	PROCEDURE MarkSector(volume: Volume; sec: LONGINT);
+	BEGIN
+		ASSERT(~(ReadOnly IN volume.flags));
+		MarkBlock(volume, sec DIV SectorFactor)
+	END MarkSector;
+	
+	PROCEDURE FreeSector(volume: Volume; sec: LONGINT);
+	BEGIN
+		ASSERT(~(ReadOnly IN volume.flags));
+		ASSERT(Marked(volume, sec));
+		FreeBlock(volume, sec DIV SectorFactor)
+	END FreeSector;
+	
+	PROCEDURE Marked(volume: Volume; sec: LONGINT): BOOLEAN;
+	BEGIN
+		ASSERT(~(ReadOnly IN volume.flags));
+		RETURN IsBlockMarked(volume, sec DIV SectorFactor)
+	END Marked;
+	
+	PROCEDURE AllocBlock(volume: Volume; hint: LONGINT; VAR adr: LONGINT);
+	BEGIN
+		ASSERT(~(ReadOnly IN volume.flags));
+		ASSERT(volume.size - volume.used > volume.reserved); 
+		ASSERT(hint >= 0);
+		IF hint > volume.size THEN hint := 0 END;
+		adr := hint + 1;
+		LOOP
+			IF adr > volume.size THEN adr := 0 END;
+			IF (adr MOD 32) IN volume.map[adr DIV 32] THEN
+				INC(adr) (* block in use *)
+			ELSE
+				INCL(volume.map[adr DIV 32], adr MOD 32);
+				EXIT
+			END;
+			ASSERT(adr # hint)
+		END;
+		INC(volume.used)
+	END AllocBlock;
+	
+	PROCEDURE FreeBlock(volume: Volume; adr: LONGINT);
+	BEGIN
+		ASSERT((adr >= 1) & (adr <= volume.size));
+		ASSERT(~(ReadOnly IN volume.flags));
+		EXCL(volume.map[adr DIV 32], adr MOD 32);
+		DEC(volume.used)
+	END FreeBlock;
+	
+	PROCEDURE MarkBlock(volume: Volume; adr: LONGINT);
+	BEGIN
+		ASSERT((adr >= 1) & (adr <= volume.size));
+		ASSERT(~(ReadOnly IN volume.flags));
+		INCL(volume.map[adr DIV 32], adr MOD 32);
+		INC(volume.used)
+	END MarkBlock;
+	
+	PROCEDURE IsBlockMarked(volume: Volume; adr: LONGINT): BOOLEAN;
+	BEGIN
+		ASSERT((adr >= 1) & (adr <= volume.size));
+		ASSERT(~(ReadOnly IN volume.flags));
+		RETURN (adr MOD 32) IN volume.map[adr DIV 32]
+	END IsBlockMarked;
+						
+	(* get block from adr [1..size] of volume *)
+	PROCEDURE GetBlock(volume: Volume; adr: LONGINT; VAR blk: ARRAY OF CHAR);
+	VAR block: LONGINT; ok: BOOLEAN;
+	BEGIN
+		IF (adr < 1) OR (adr > volume.size) THEN SYSTEM.HALT(15) END;
+		ASSERT(volume.startfs > 0); (* startfs initialized *)
+		ASSERT(LEN(blk) >= volume.blockSize); (* index check *)
+		block := volume.startfs + (adr-1) * volume.blocks;
+		DiskDriver.Transfer(DiskDriver.devices[volume.devId], TRUE, block, volume.blocks, blk, 0, ok);
+		IF ~ok THEN SYSTEM.HALT(17) END
+	END GetBlock;
+						
+	(* put block to adr [1..size] of volume *)
+	PROCEDURE PutBlock(volume: Volume; adr: LONGINT; VAR blk: ARRAY OF CHAR);
+	VAR block: LONGINT; ok: BOOLEAN; 
+	BEGIN
+		IF (adr < 1) OR (adr > volume.size) THEN SYSTEM.HALT(15) END;
+		ASSERT(volume.startfs > 0); (* startfs initialized *)
+		ASSERT(LEN(blk) >= volume.blockSize);	(* index check *)
+		block := volume.startfs + (adr-1) * volume.blocks;
+		DiskDriver.Transfer(DiskDriver.devices[volume.devId], FALSE, block, volume.blocks, blk, 0, ok);
+		IF ~ok THEN Output.Text("Disk transfer error"); SYSTEM.HALT(17) END
+	END PutBlock;
+						
+	PROCEDURE CreateVolume(VAR volume: Volume; VAR device: DiskDriver.Device; partitionNo: LONGINT);
+	VAR ok: BOOLEAN; i: LONGINT; name: VolumeName; startfs, size, vbs: LONGINT;
+	BEGIN
+		ASSERT(volume = NIL); 
+		MakeVolumeName(name, device.ctrlId + device.devNum, partitionNo);
+		ASSERT(device.enabled);
+		IF ~device.initialized THEN DiskDriver.Open(device, ok) ELSE ok := TRUE END;
+		IF Trace THEN Output.Text(name) END;
+		IF ok THEN
+			IF ((LEN(device.table) = 1) & (partitionNo = 0)) OR ((partitionNo > 0) & (partitionNo < LEN(device.table))) THEN
+				IF ~(DiskDriver.Mounted IN device.table[partitionNo].flags) THEN
+					GetOberonFS(device, device.table[partitionNo].start, device.table[partitionNo].size, startfs, size, vbs, ok);
+					IF ok & (size > 0) & (vbs MOD device.blockSize = 0) THEN
+						NEW(volume);
+						COPY(name, volume.name);
+						ASSERT(device.ctrlId + device.devNum = device.devId);
+						volume.devId := device.devId; volume.partNo := partitionNo;
+						volume.flags := {};
+						IF DiskDriver.RemovableBit IN device.id.type THEN INCL(volume.flags, ReadOnly) END;
+						ASSERT(vbs MOD BS = 0);
+						volume.blockSize := vbs;
+						volume.blocks := vbs DIV device.blockSize;
+						volume.size := size; volume.reserved := SystemReserved;
+						CreateAllocationTable(volume);
+						volume.startfs := startfs; volume.state := Closed;
+						INCL(device.table[partitionNo].flags, DiskDriver.Mounted);
+						IF Trace THEN Output.Text(" mounted") END
+					ELSE 
+						IF Trace THEN Output.Text(" not mounted") END
+					END
+				ELSE 
+					IF Trace THEN Output.Text(" already mounted") END
+				END
+			ELSE 
+				IF Trace THEN Output.Text(" invalid partition") END
+			END
+		ELSE 
+			IF Trace THEN Output.Text(" device not available") END
+		END;
+		IF Trace THEN Output.Line END
+	END CreateVolume;
+	
+	PROCEDURE GetOberonFS(VAR device: DiskDriver.Device; pstart, psize: LONGINT; 
+		VAR startfs, size, vbs: LONGINT; VAR ok: BOOLEAN);
+	CONST FSID = 21534F41H; FSVer = 2; OberonSS = 4096; NSS = 2048;
+	VAR i, x, bc, fsofs: LONGINT; b: ARRAY CDBS OF CHAR;
+	BEGIN
+		startfs := 0; size := 0; vbs := 0; fsofs := 0; (* fsofs is the file system offset from the partition start in 512-byte blocks *)
+		IF (device.blockSize = BS) & (psize > 0) THEN (* "normal" device with 512-byte blocks *)
+			DiskDriver.Transfer(device, TRUE, pstart, 1, b, 0, ok) (* read boot block of partition/disk *)
+		ELSIF (device.blockSize = CDBS) & (psize > 17) THEN
+			(* typically pstart = 0 *)
+			DiskDriver.Transfer(device, TRUE, pstart + 17, 1, b, 0, ok); (* read El Torito boot record *)
+			IF ok THEN
+				bc := Get4(b, 47H); (* boot catalog location *)
+				i := 0; WHILE (i < 20H) & (b[i] = cdid[i]) DO INC(i) END;
+				IF (i = 20H) & (bc > 0) & (bc < psize) THEN
+					DiskDriver.Transfer(device, TRUE, pstart + bc, 1, b, 0, ok); (* read boot catalog *)
+					IF (b[0] = 1X) & (b[1EH] = 55X) & (b[1FH] = 0AAX) THEN (* validation entry ok (skip checksum) *)
+						x := Get4(b, 20H+8); (* start of virtual disk *)
+						IF (x > 0) & (x < psize) THEN
+							DiskDriver.Transfer(device, TRUE, pstart + x, 1, b, 0, ok); (* read boot block of virtual disk *)
+							fsofs := x * (CDBS DIV BS) (* convert to 512-byte block address *)
+						ELSE ok := FALSE
+						END
+					ELSE ok := FALSE
+					END
+				END
+			END;
+			IF ~ok THEN 
+				IF Trace THEN Output.Text("CD not bootable"); Output.Line END
+			END
+		ELSE
+			ok := FALSE; 
+			IF Trace THEN Output.Text("Unsupported device block size"); Output.Line END
+		END;
+		IF ok THEN (* check boot sector *)
+			b[0] := "x"; b[1] := "x"; b[2] := "x"; b[9] := 0X;
+			IF (b[510] = 55X) & (b[511] = 0AAX) THEN (* boot sector id found *)
+				ASSERT(fsofs >= 0);
+				IF (Get4(b, 1F8H) = FSID) & (b[1FCH] = CHR(FSVer)) & (ASH(1, ORD(b[1FDH])) = OberonSS) THEN 
+				       IF Trace THEN Output.Text(" OberonFS detected") END;
+					(* boot block id found *)
+					vbs := OberonSS;
+					x := fsofs + Get4(b, 1F0H);	(* get offset in 512-byte blocks *)
+					ASSERT(x >= 0);
+					size := Get4(b, 1F4H);	(* size in volume blocks *)
+					ASSERT(size >= 0);
+					ASSERT(OberonSS MOD device.blockSize = 0);
+					ASSERT(x + size * (OberonSS DIV BS) <= psize * (device.blockSize DIV BS)); (* range check *)
+					ASSERT(x MOD (device.blockSize DIV BS) = 0);	(* correctly aligned *)
+					startfs := pstart + x DIV (device.blockSize DIV BS)	(* offset from start of device in device blocks *)
+				ELSIF b = "xxxOBERON" THEN	(* Oberon boot block id found *)
+				       IF Trace THEN Output.Text("NatFS detected") END;
+					vbs := NSS; (* NatFS *)
+					x := ORD(b[0EH]) + 256*LONG(ORD(b[0FH])); (* reserved 512-byte blocks *)
+					size := ORD(b[13H]) + 256*LONG(ORD(b[14H])); (* small size in 512-byte blocks *)
+					IF size = 0 THEN size := Get4(b, 20H) END; (* large size in 512-byte blocks *)
+					IF size > psize * (device.blockSize DIV BS) THEN (* limit to partition/disk size *)
+						size := psize * (device.blockSize DIV BS)
+					END;
+					DEC(size, x); (* file system size in 512-byte blocks *)
+					INC(x, fsofs); (* file system offset in 512-byte blocks *)
+					ASSERT(x MOD (device.blockSize DIV BS) = 0); (* correctly aligned *)
+					startfs := pstart + x DIV (device.blockSize DIV BS);	(* offset from start of device in device blocks *)
+					size := size DIV (NSS DIV BS)	(* convert 512-byte blocks to volume blocks *)
+				ELSE ok := FALSE; 
+					IF Trace THEN Output.Text("Unsupported file system"); Output.Line END
+				END
+			ELSE ok := FALSE; 
+				IF Trace THEN Output.Text(" Partition not formatted"); Output.Line END
+			END
+		END;
+		ASSERT((startfs >= 0) & (size >= 0))
+	END GetOberonFS;
+	
+	PROCEDURE Get4(VAR b: ARRAY OF CHAR; i: LONGINT): LONGINT;
+	BEGIN RETURN ORD(b[i]) + ASH(ORD(b[i+1]), 8) + ASH(ORD(b[i+2]), 16) + ASH(ORD(b[i+3]), 24)
+	END Get4;
+	
+	PROCEDURE MakeVolumeName(VAR name: VolumeName; devId, partNo: LONGINT);
+	VAR temp: ARRAY 10 OF CHAR;
+	BEGIN 
+		COPY("IDE", name); ToText(devId, temp); Append(name, temp); Append(name, "#"); 
+		ToText(partNo, temp); Append(name, temp)
+	END MakeVolumeName;
+	
+	PROCEDURE ToText(i: LONGINT; VAR t: ARRAY OF CHAR);
+	VAR j, k: LONGINT; digits: ARRAY 10 OF LONGINT;
+	BEGIN
+		ASSERT(i # MIN(LONGINT)); (* not supported *)
+		IF (i < 0) THEN i := -i; t[0] := "-"; j := 1 ELSE j := 0 END;
+		k := 0; digits[k] := 0;
+		WHILE (i > 0) DO
+			digits[k] := i MOD 10; i := i DIV 10;  INC(k)
+		END;
+		IF (k > 0) THEN DEC(k) END; 
+		WHILE (k >= 0) DO
+			t[j] := CHR(digits[k] + ORD("0")); INC(j); DEC(k)
+		END;
+		t[j] := 0X
+	END ToText;
+	
+	PROCEDURE Append(VAR to: ARRAY OF CHAR; app: ARRAY OF CHAR);
+	VAR i, j, l: LONGINT;
+	BEGIN
+		l := LEN(to)-1;
+		i := 0; WHILE (i < l) & (to[i] # 0X) DO INC(i) END;
+		j := 0; WHILE (i < l) & (app[j] # 0X) DO to[i] := app[j]; INC(i); INC(j) END;
+		to[i] := 0X
+	END Append;
+	
+	PROCEDURE CreateAllocationTable(VAR volume: Volume);
+	VAR maplen: LONGINT;
+	BEGIN
+		ASSERT(volume.map = NIL);
+		IF ~(ReadOnly IN volume.flags) THEN
+			maplen := (volume.size + 1 + 31) DIV 32;
+			NEW(volume.map, maplen);
+			WHILE maplen > 0 DO DEC(maplen); volume.map[maplen] := {} END;
+			INCL(volume.map[0], 0); (* reserve sector 0 (illegal to use) *)
+			volume.used := 0
+		ELSE
+			volume.used := volume.size
+		END
+	END CreateAllocationTable;
+		
+	PROCEDURE InternalMountVolume(VAR device: DiskDriver.Device; partitionNo: LONGINT);
+	VAR i: LONGINT;
+	BEGIN
+		IF ~ExistsVolume(device.devId, partitionNo) THEN
+			i := 0; WHILE (i < LEN(volumes)) & (volumes[i] # NIL) DO INC(i) END;
+			ASSERT(i < LEN(volumes), 211); (* too many volumes *)
+			CreateVolume(volumes[i], device, partitionNo);
+			IF volumes[i] # NIL THEN 
+				LoadVolume(volumes[i]);
+				IF default = NIL THEN InternalSetDefaultVolume(volumes[i]) END
+			END
+		ELSE
+			Output.Text("already mounted"); Output.Line
+		END
+	END InternalMountVolume;
+	
+	PROCEDURE InternalUnmountVolume(VAR volume: Volume);
+	VAR i: LONGINT;
+	BEGIN
+		IF openFiles # NIL THEN
+			FOR i := 0 TO LEN(openFiles)-1 DO
+				IF (openFiles[i] # NIL) & (openFiles[i].volume = volume) THEN
+					Unbuffer(openFiles[i]); FreeFile(openFiles[i])
+				END
+			END
+		END;
+		CleanupDirectory(volume);
+		IF DiskDriver.devices[volume.devId].table # NIL THEN
+			EXCL(DiskDriver.devices[volume.devId].table[volume.partNo].flags, DiskDriver.Mounted)
+		END;
+		IF default = volume THEN default := NIL END;
+		FreeVolume(volume);
+		IF default = NIL THEN SetNewDefault END
+	END InternalUnmountVolume;
+	
+	PROCEDURE SetNewDefault;
+	VAR i: LONGINT;
+	BEGIN
+		i := LEN(volumes)-1; WHILE (i >= 0) & (volumes[i] = NIL) DO DEC(i) END;
+		IF i >= 0 THEN InternalSetDefaultVolume(volumes[i]) END
+	END SetNewDefault;
+	
+	PROCEDURE LoadLastPartition(VAR device: DiskDriver.Device; VAR ok: BOOLEAN);
+	CONST OberonFSType = 76;
+	VAR partNo: LONGINT; 
+	BEGIN
+		ASSERT(device.enabled);
+		IF ~device.initialized THEN DiskDriver.Open(device, ok) ELSE ok := TRUE END;
+		IF ok THEN
+			ok := FALSE;
+			partNo := LEN(device.table)-1;
+			WHILE (partNo >= 0) & ~ok DO
+				IF device.table[partNo].type = OberonFSType THEN
+					InternalMountVolume(device, partNo);
+					ok := ExistsVolume(device.devId, partNo)
+				END;
+				DEC(partNo)
+			END
+		END
+	END LoadLastPartition;
+	
+	PROCEDURE LoadLastVolume*;
+	VAR devId: LONGINT; ok: BOOLEAN;
+	BEGIN
+		Lock;
+		devId := LEN(DiskDriver.devices)-1; ok := FALSE;
+		WHILE (devId >= 0) & ~ok DO
+			IF DiskDriver.devices[devId].enabled THEN
+				LoadLastPartition(DiskDriver.devices[devId], ok)
+			END;
+			DEC(devId)
+		END;
+		Unlock;
+		IF Trace THEN 
+			Output.Text("LoadLastVolume");
+			IF ok THEN Output.Text(" ok") ELSE Output.Text(" failed") END
+		END
+	END LoadLastVolume;
+	
+	PROCEDURE Initialize*;
+	VAR i: LONGINT;
+	BEGIN
+		ASSERT(~initialized);
+		Lock;
+		DiskDriver.Initialize;
+		NEW(openFiles, 2); lastId := 1;
+		cdid := "?CD001?EL TORITO SPECIFICATION?";
+		cdid[0] := 0X; cdid[6] := 1X; cdid[30] := 0X; cdid[31] := 0X;
+		FOR i := 0 TO LEN(volumes)-1 DO volumes[i] := NIL END;
+		default := NIL;
+		Unlock;
+		initialized := TRUE
+	END Initialize;
+	
+	PROCEDURE Lock;
+	BEGIN Concurrency.Lock(lock)
+	END Lock;
+	
+	PROCEDURE Unlock;
+	BEGIN Concurrency.Unlock(lock)
+	END Unlock;
+	
+BEGIN 
+	Concurrency.InitializeLock(lock);
+	initialized := FALSE
+END ComFileSystem.

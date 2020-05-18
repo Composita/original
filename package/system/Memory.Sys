@@ -1,0 +1,483 @@
+MODULE Memory {UNCHECKED}; (** Kernel, Memory Resources, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Processors; (* no stack overflow checks *)
+	
+	(** 
+		Generic main memory support
+		Initialization of memory segmentation based on Pieter Muller's Aos implementation
+		
+		Allocation/deallocation of contiguous memory blocks, used for heap and stacks, individually configurable
+		 - Every processor has its own kernel stack for interrupt handling in kernel mode
+		 - Flat segmentation is used for protected mode
+		 - No virtual memory (paging) 
+		 - Reserved memory regions are already preallocated
+	*)
+	
+	(* default real memory layout:
+		0..512KB: RAM, image located above 4KB, 508KB..512KB is boot page for multi-processor
+	    512..640KB: (RAM), RAM on most machines
+	    640KB..1MB: ROM, I/O
+	    1MB..1MB+4*KB: I/O (ACPI Boot table)
+        1MB+4*KB..(at most) 4GB-25MB: RAM
+	    4GB-25MB .. 4GB: I/O *)
+			
+	CONST
+		KB* = 1024; MB* = 1024 * KB; GB* = 1024 * MB; 
+		ExtMemAdr = MB + 4*KB;
+		MaxMemoryLimit = 4*GB - 25*MB; (* APIC memory-mapped IO is at 0FFEE00000H *)
+		
+		MaxBlocks = 32;
+		
+		Nil* = 0FFFFF800H; (* outside the physical segment range *)
+		
+	TYPE
+		Address* = CARDINAL;
+		Block* = RECORD start*: Address; size*: CARDINAL END;
+	
+	TYPE
+		(* task state segment, see IA32 spec, vol 3, 6.5 *)
+		TSSDescriptor = RECORD
+			Link: CARDINAL;	(* previous task link, lower 16 bits significant *)
+			ESP0: CARDINAL;
+			ESS0: CARDINAL;	(* lower 16 bits significant *)
+			ESP1: CARDINAL;
+			ESS1: CARDINAL;	(* lower 16 bits significant *)
+			ESP2: CARDINAL;
+			ESS2: CARDINAL;	(* lower 16 bits significant *)
+			CR3: CARDINAL;
+			EIP: CARDINAL;
+			EFLAGS: SET;
+			EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI: CARDINAL;
+			ES, CS, SS, DS, FS, GS: CARDINAL;	(* lower 16 bits significant *)
+			LDT: CARDINAL;	(* lower 16 bits significant *)
+			TaskAttributes: INTEGER;
+			IOBitmapOffset: INTEGER
+			(* Implicit: IOBitmap: ARRAY 8192 DIV 4 OF SET *)
+		END;
+		
+		Stack* = RECORD
+			low*, high*: Address;
+		END;
+		
+		ProcessorState = RECORD
+			tss: TSSDescriptor;
+			kernelSystemStack: Stack; (* system stack in kernel mode *)
+			userSystemStack: Stack; (* system stack in user mode *)
+			currentStack: Stack;
+			(* for stack overflow checks *)
+			stackReserve: LONGINT;
+		END;
+	
+	TYPE
+		(* Segments, see IA32 spec, vol 3, 3.2 - 3.5 *)	
+	
+		SegmentDescriptor = RECORD
+			low, high: CARDINAL
+		END;
+	
+	CONST
+		NofNormalSegments = 6;
+		NofTSSSegments = Processors.MaxProcessors;
+		NofSegments = NofNormalSegments + NofTSSSegments;
+
+		KernelCodeSegmentIndex = 1;
+		KernelStackSegmentIndex = 2;
+		UserCodeSegmentIndex = 3;
+		DataSegmentIndex = 4;
+		UserStackSegmentIndex = 5;
+		
+		KernelCodeSegmentSelector* = KernelCodeSegmentIndex * 8; (* requested privilege level (RPL) 0 *)
+		KernelStackSegmentSelector* = KernelStackSegmentIndex * 8; (* RPL 0 *)
+		UserCodeSegmentSelector* = UserCodeSegmentIndex * 8 + 3; (* RPL 3 *)
+		DataSegmentSelector* = DataSegmentIndex * 8; (* RPL 0 *)
+		UserStackSegmentSelector* = UserStackSegmentIndex * 8 + 3; (* RPL 3 *)
+		FirstKernelTaskRegister* = NofNormalSegments * 8; (* RPL 0 *)
+		
+	TYPE
+		(* global descriptor table, see IA32 spec, vol 3, 3.5.1 *)
+		GDT = ARRAY NofSegments+1 OF SegmentDescriptor; (* additional zero segment *)
+	
+	CONST
+		KernelSystemStackSize = 128*KB;  (* for system execution in kernel mode *)
+		UserSystemStackSize = 128*KB; (* for system execution in user mode *)
+		SystemMemoryReserve* = Processors.MaxProcessors * (KernelSystemStackSize + UserSystemStackSize);
+		
+		(** stack overflow checking, maximum stack space for 
+			unchecked procedure stack frames, and overflow trap handling *)
+		KernelSystemStackReserve* = 4*KB; 
+		UserSystemStackReserve* = 4*KB;
+	
+	VAR
+		lock: Processors.SpinLock;
+		memorySize-: CARDINAL;
+		
+		allocations: ARRAY MaxBlocks OF Block;
+		nofAllocations: LONGINT;
+		
+		gdt: GDT; (* global descriptor table *)
+		
+		processorState: ARRAY Processors.MaxProcessors OF ProcessorState;
+				
+	(* block.size = 0 if not allocatable *)
+	PROCEDURE NewBlock*(size: CARDINAL; VAR block: Block);
+	BEGIN
+		Processors.AcquireLock(lock);
+		InternalFindFreeBlock(size, block);
+		IF block.size = size THEN InternalAllocate(block) END;
+		Processors.ReleaseLock(lock)
+	END NewBlock;
+		
+	PROCEDURE Allocate*(block: Block);
+	BEGIN
+		Processors.AcquireLock(lock);
+		InternalAllocate(block);
+		Processors.ReleaseLock(lock)
+	END Allocate;
+	
+	PROCEDURE Deallocate*(block: Block);
+	BEGIN
+		Processors.AcquireLock(lock);
+		InternalDeallocate(block);
+		Processors.ReleaseLock(lock)
+	END Deallocate;
+	
+	PROCEDURE LargestFreeBlockSize*(): CARDINAL;
+	VAR l, h, m: CARDINAL; block: Block;
+	BEGIN
+		Processors.AcquireLock(lock);
+		(* binary search *)
+		l := 1; h := memorySize;
+		WHILE l < h DO
+			(* unsigned m := (l+h) DIV 2 *)
+			m := (l DIV 2) + (h DIV 2);
+			IF (l MOD 2 # 0) & (h MOD 2 # 0) THEN INC(m) END; 
+			InternalFindFreeBlock(m, block);
+			IF block.size = 0 THEN (* too large *)
+				h := m
+			ELSE (* small enough *)
+				l := m+1
+			END
+		END;
+		Processors.ReleaseLock(lock);
+		RETURN l-1
+	END LargestFreeBlockSize;
+
+	(* internal procedures must have lock acquired *)
+	
+	PROCEDURE InternalAllocate(block: Block);
+	BEGIN
+		ASSERT(Processors.IsLocked(lock));
+		ASSERT(InternalIsFree(block), 100);
+		ASSERT(block.size > 0);
+		ASSERT(nofAllocations < LEN(allocations), 101); (* too many allocations *)
+		allocations[nofAllocations] := block; INC(nofAllocations)
+	END InternalAllocate;
+	
+	PROCEDURE InternalDeallocate(block: Block);
+	VAR i, k: LONGINT;
+	BEGIN
+		ASSERT(Processors.IsLocked(lock));
+		i := 0; WHILE (i < nofAllocations) & (allocations[i].start # block.start) & (allocations[i].size # block.size) DO INC(i) END;
+		IF i = nofAllocations THEN
+			HALT(102) (* block is not allocated *)
+		ELSE
+			FOR k := i+1 TO nofAllocations-1 DO allocations[k-1] := allocations[k] END;
+			allocations[nofAllocations].start := 0; allocations[nofAllocations].size := 0;
+			DEC(nofAllocations)
+		END
+	END InternalDeallocate;
+	
+	PROCEDURE InternalIsFree(block: Block): BOOLEAN;
+	VAR i: LONGINT;
+	BEGIN
+		ASSERT(Processors.IsLocked(lock));
+		ASSERT(block.start >= 0); ASSERT(block.size > 0);
+		IF block.start + block.size > memorySize THEN RETURN FALSE END;
+		FOR i := 0 TO nofAllocations-1 DO
+			IF ((block.start <= allocations[i].start) & (block.start + block.size > allocations[i].start)) OR
+				((allocations[i].start <= block.start) & (allocations[i].start + allocations[i].size > block.start)) THEN (* overlapping *)
+				RETURN FALSE
+			END
+		END;
+		RETURN TRUE
+	END InternalIsFree;
+	
+	(* block.size = 0 if no such free block present *)
+	PROCEDURE InternalFindFreeBlock(size: CARDINAL; VAR block: Block);
+	VAR i: LONGINT; 
+	BEGIN
+		ASSERT(Processors.IsLocked(lock));
+		ASSERT(size > 0);
+		block.start := 0; block.size := size; i := 0;
+		WHILE (i < nofAllocations) & ~InternalIsFree(block) DO block.start := allocations[i].start + allocations[i].size; INC(i) END;
+		IF ~InternalIsFree(block) THEN
+			block.start := 0; block.size := 0
+		END
+	END InternalFindFreeBlock;
+	
+	(** System stack in kernel mode *)
+	PROCEDURE GetKernelSystemStack*(VAR stack: Stack);
+	BEGIN stack := processorState[Processors.ID()].kernelSystemStack
+	END GetKernelSystemStack;
+	
+	(** System stack in user mode *)
+	PROCEDURE GetUserSystemStack*(VAR stack: Stack);
+	BEGIN stack := processorState[Processors.ID()].userSystemStack
+	END GetUserSystemStack;
+				
+	(* stack overflow checking *)
+	PROCEDURE GetCurrentStack*(VAR stack: Stack; VAR reserve: LONGINT);
+	VAR id: LONGINT;
+	BEGIN
+		id := Processors.ID();
+		stack := processorState[id].currentStack;
+		reserve := processorState[id].stackReserve
+	END GetCurrentStack;
+	
+	PROCEDURE SetCurrentStack*(stack: Stack; reserve: LONGINT);
+	VAR id: LONGINT;
+	BEGIN
+		ASSERT(reserve >= 0);
+		id := Processors.ID();
+		processorState[id].currentStack := stack; 
+		processorState[id].stackReserve := reserve;
+		SetStackLimit(stack.low + reserve);
+		(* ESI reserved for stack boundary and for fast stack overflow checks *)
+	END SetCurrentStack;
+	
+	PROCEDURE -SetStackLimit*(limit: Address);
+	CODE {SYSTEM.i386}
+		POP ESI
+	END SetStackLimit;
+	
+	PROCEDURE -GetStackLimit*(): Address;
+	CODE {SYSTEM.i386}
+		MOV EAX, ESI
+	END GetStackLimit;
+	
+	PROCEDURE RemainingStackSize*(): LONGINT;
+	CODE {SYSTEM.i386}
+		MOV EAX, ESP
+		SUB EAX, ESI (* ESI represents stack boundary *)
+	END RemainingStackSize;
+					
+	(* initialization *)
+	
+	PROCEDURE IsRAM(adr: Address): BOOLEAN;
+	CONST Pattern1 = 0BEEFC0DEH; Pattern2 = 0AA55FF00H;
+	VAR save, x: CARDINAL; ok: BOOLEAN;
+	BEGIN
+		ok := FALSE;
+		SYSTEM.GET(adr, save);
+		SYSTEM.PUT(adr, Pattern1); (* attempt 1st write *)
+		x := Pattern2; (* write something else *)
+		SYSTEM.GET(adr, x); (* attempt 1st read *)
+		IF x = Pattern1 THEN (* first test passed *)
+			SYSTEM.PUT(adr, Pattern2); (* attempt 2nd write *)
+			x := Pattern1; (* write something else *)
+			SYSTEM.GET(adr, x); (* attempt 2nd read *)
+			ok := (x = Pattern2)
+		END;
+		SYSTEM.PUT(adr, save);
+		RETURN ok
+	END IsRAM;
+	
+	PROCEDURE ComputeMemorySize;
+	CONST Step = MB; DisplaySize = 4*MB;
+	VAR adr: Address;
+	BEGIN
+		memorySize := ExtMemAdr; adr := memorySize - 4;
+		WHILE (memorySize <= MaxMemoryLimit) & (memorySize <= Processors.displayAddress - DisplaySize) & IsRAM(adr) DO
+			memorySize := adr + 4; INC(adr, Step)
+		END
+	END ComputeMemorySize;
+	
+	PROCEDURE InitializeMemorySpace;
+	VAR block: Block;
+	BEGIN
+		nofAllocations := 0;
+		ComputeMemorySize;
+		block.start := 0; block.size := ExtMemAdr;
+		Allocate(block) (* reserve 0 .. ExtMemAdr for kernel image, kernel stack, MP-boot code, and ROM, I/O *)
+	END InitializeMemorySpace;
+	
+	(* Generate a memory segment descriptor; type IN {0..7}; dpl IN {0..3};
+		type:
+		0	data, expand-up, read-only
+		1	data, expand-up, read-write
+		2	data, expand-down, read-only
+		3	data, expand-down, read-write
+		4	code, non-conforming, execute-only
+		5	code, non-conforming, execute-read
+		6	code, conforming, execute-only
+		7	code, conforming, execute-read *)
+	PROCEDURE GenerateSegmentDescriptor(type, base, limit, dpl: CARDINAL; page: BOOLEAN; VAR sd: SegmentDescriptor);
+	VAR s: SET;
+	BEGIN
+		sd.low := SYSTEM.LSH(base MOD 10000H, 16) + limit MOD 10000H;
+		s := SYSTEM.VAL(SET, SYSTEM.LSH(SYSTEM.LSH(base, -24), 24) + SYSTEM.LSH(SYSTEM.LSH(limit, -16), 16) + 
+			SYSTEM.LSH(dpl, 13) + SYSTEM.LSH(type, 9) + SYSTEM.LSH(base, -16) MOD 100H);
+		s := s + {12, 15, 22};	(* code/data=1, present=1, 32-bit=1, A=0, AVL=0 *)
+		IF page THEN INCL(s, 23) END;	(* page granularity *)
+		sd.high := SYSTEM.VAL(CARDINAL, s)
+	END GenerateSegmentDescriptor;
+	
+	(* Generate a TSS descriptor. See IA32, vol 3, 6.2.2 *)
+	PROCEDURE GenerateTSSDescriptor(base, limit, dpl: CARDINAL; VAR sd: SegmentDescriptor);
+	VAR s: SET;
+	BEGIN
+		sd.low := SYSTEM.LSH(base MOD 10000H, 16) + limit MOD 10000H;
+		s := SYSTEM.VAL(SET, SYSTEM.LSH(SYSTEM.LSH(base, -24), 24) + SYSTEM.LSH(SYSTEM.LSH(limit, -16), 16) + 
+			SYSTEM.LSH(dpl, 13) + SYSTEM.LSH(base, -16) MOD 100H);
+		s := s + {8, 11, 15};	(* type=non-busy TSS, present=1, AVL=0, 32-bit=0 *)
+		sd.high := SYSTEM.VAL(CARDINAL, s)
+	END GenerateTSSDescriptor;
+	
+	PROCEDURE InitializeTSS(VAR tss: TSSDescriptor);
+	BEGIN
+		tss.Link := 0; tss.ESP0 := 0; tss.ESS0 := 0; tss.ESP1 := 0; tss.ESS1 := 0; tss.ESP2 := 0; tss.ESS2 := 0;
+		tss.CR3 := 0; tss.EIP := 0; tss.EFLAGS := {}; tss.EAX := 0; tss.ECX := 0; tss.EDX := 0; tss.EBX := 0;
+		tss.ESP := 0; tss.EBP := 0; tss.ESI := 0; tss.EDI := 0; tss.ES := 0; tss.CS := 0; tss.SS := 0; tss.DS := 0; 
+		tss.FS := 0; tss.GS := 0; tss.LDT := 0; tss.TaskAttributes := 0; tss.IOBitmapOffset := -1 (* no bitmap *)
+	END InitializeTSS;
+	
+	PROCEDURE GDTBaseAddress*(): Address;
+	BEGIN RETURN SYSTEM.ADR(gdt[0])
+	END GDTBaseAddress;
+	
+	(* Load global descriptor table *)
+	PROCEDURE LoadGDT(base, size: CARDINAL);
+	CODE {SYSTEM.i386, SYSTEM.Privileged}
+		SHL size[EBP], 16
+		MOV EBX, 2
+		LGDT size[EBP][EBX]
+	END LoadGDT;
+
+	(* Load segment registers *)
+	PROCEDURE LoadSegmentRegisters;
+	CODE {SYSTEM.i386}
+		MOV EAX, DataSegmentSelector
+		MOV DS, AX
+		MOV ES, AX
+		
+		XOR EAX, EAX
+		MOV FS, AX
+		MOV GS, AX
+	END LoadSegmentRegisters;
+	
+	(* initialize flat segment model for protected mode, i.e. do not use segments *)
+	PROCEDURE InitializeSegments;
+	VAR i: LONGINT; limit: CARDINAL; 
+	BEGIN
+		limit := MB-2; (* last 4KB (highest) memory are reserved for NIL-traps *)
+			(* for privilege levels (DPL, RPL, CPL), see IA32, vol 3, 4.5ff *)
+			(* GDT 0: Null segment *)
+		gdt[0].low := 0; gdt[0].high := 0;
+			(* GDT 1: Kernel code: non-conforming, execute-read, base 0, limit 4G - 4K, descriptor privilege level (DPL) 0 *)
+		GenerateSegmentDescriptor(5, 0, limit, 0, TRUE, gdt[KernelCodeSegmentIndex]);
+			(* GDT 2: Kernel stack: expand-up, read-write, base 0, limit 4G - 4K, DPL 0 *)
+		GenerateSegmentDescriptor(1, 0, limit, 0, TRUE, gdt[KernelStackSegmentIndex]);
+			(* GDT 3: User code: conforming, execute-read, base 0, limit 4G - 4K, DPL 0 *)
+		GenerateSegmentDescriptor(7, 0, limit, 0, TRUE, gdt[UserCodeSegmentIndex]);
+			(* GDT 4: User/Kernel data: expand-up, read-write, base 0, limit 4G - 4K, DPL 3 *)
+		GenerateSegmentDescriptor(1, 0, limit, 3, TRUE, gdt[DataSegmentIndex]);
+			(* GDT 5: User stack: expand-up, read-write, base 0, limit 4G - 4K, DPL 3 *)
+		GenerateSegmentDescriptor(1, 0, limit, 3, TRUE, gdt[UserStackSegmentIndex]);
+			(* GDT 6..5+Processors.MaxProcessors: Kernel TSS *)
+		FOR i := 0 TO Processors.MaxProcessors-1 DO
+			InitializeTSS(processorState[i].tss);
+			GenerateTSSDescriptor(SYSTEM.ADR(processorState[i].tss), SIZE(TSSDescriptor)-1, 0, gdt[NofNormalSegments + i])
+		END
+	END InitializeSegments;
+	
+	(* interupts must be off *)
+	PROCEDURE EnableSegments;
+	BEGIN
+		LoadGDT(SYSTEM.ADR(gdt[0]), SIZE(GDT)-1);
+		LoadSegmentRegisters
+	END EnableSegments;
+	
+	PROCEDURE NewSystemStack(VAR stack: Stack; size: CARDINAL);
+	VAR block: Block;
+	BEGIN
+		NewBlock(size, block);
+		ASSERT(block.size = size, 103); (* stack not allocated *)
+		stack.low := block.start;
+		stack.high := block.start + block.size
+	END NewSystemStack;
+	
+	PROCEDURE -SetTaskRegister(tr: LONGINT);
+	CODE {SYSTEM.i386, SYSTEM.Privileged}
+		POP EAX
+		LTR AX
+	END SetTaskRegister;
+	
+	(** Switch stack to new stack:
+		 Stack layout:
+				 caller1 return
+				 caller1 EBP	<-- caller0 EBP
+				 [caller0 locals]
+		 04	caller0 return
+		 00	caller0 EBP	<-- EBP
+			 	locals			 <-- ESP
+	*)
+	PROCEDURE -SwitchStack(esp: Address);
+	CODE {SYSTEM.i386}
+		POP EAX				; esp
+		
+		MOV EBX, 4[EBP]	; caller0 return
+		MOV ECX, [EBP]	  ; caller0 EBP
+		MOV ECX, 4[ECX]	; caller1 return
+		
+		MOV -4[EAX], ECX ; caller1 return on new stack
+		MOV DWORD -8[EAX], Nil ; caller1 EBP on new stack
+		
+		LEA EBP, -8[EAX]  ; new stack top
+		MOV ESP, EBP
+		
+		JMP EBX				; directly jump out of caller0 (whose locals are now inaccessible)
+	END SwitchStack;
+
+	(** switch to user-mode system stack of actual processor 
+		- caller must be top-most procedure => caller must not return (EBP is destroyed)
+		- caller's local variables are destroyed => caller must not use local variables after stack switch! *)
+	PROCEDURE SwitchToUserSystemStack*;
+	VAR id: LONGINT;
+	BEGIN
+		id := Processors.ID();
+		SetCurrentStack(processorState[id].userSystemStack, UserSystemStackReserve);
+		SwitchStack(processorState[id].userSystemStack.high); (* directly exists this procedure *)
+		HALT(80) (* should not reach this instruction *)
+	END SwitchToUserSystemStack;
+
+	(** initialize and activate kernel stack of specific processor
+		- every processor calls this once during initialization
+		- caller must guarantee mutual exclusion with other processors
+		- interrupts must be disabled
+		- preemption must be disabled
+		- segmentation is enabled
+		- caller most be top-most procedure and must not have local variables! -> return on new user system stack *)
+	PROCEDURE InitializeSystemStacks*;
+	VAR id: LONGINT;
+	BEGIN
+		EnableSegments;
+		id := Processors.ID();
+		
+		NewSystemStack(processorState[id].kernelSystemStack, KernelSystemStackSize); 
+		NewSystemStack(processorState[id].userSystemStack, UserSystemStackSize);
+		
+		processorState[id].tss.ESP0 := processorState[id].kernelSystemStack.high; (* stack grows towards lower addresses *)
+		processorState[id].tss.ESS0 := KernelStackSegmentSelector;
+		SetTaskRegister(FirstKernelTaskRegister + id * 8);
+		
+		SetCurrentStack(processorState[id].userSystemStack, UserSystemStackReserve);
+		SwitchStack(processorState[id].userSystemStack.high); (* directly exits from this procedure *)
+		HALT(80) (* should not reach this instruction *)
+	END InitializeSystemStacks;
+	
+BEGIN
+	Processors.InitializeLock(lock);
+	InitializeMemorySpace;
+	InitializeSegments;
+	InitializeSystemStacks
+END Memory.
+

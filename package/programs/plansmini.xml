@@ -1,0 +1,107 @@
+<?xml version="1.0" ?>
+<!DOCTYPE plans SYSTEM "plans.dtd">
+<plans xml:lang="de-CH">
+	<demand name="Test_population">
+		<segment id="1" name="Test_segment" />
+	</demand>
+	
+<person id="1">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:07:18" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="2">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:01:04" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+<person id="3">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:00:03" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="4">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:12:29" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="5">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:11:28" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="6">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:08:59" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="7">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:01:58" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="8">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:13:17" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="9">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:01:05" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+<person id="10">
+ <plan>
+  <act type="h" x100="000" y100="000" link="100" />
+  <leg mode="car" dep_time="07:05:07" trav_time="00:00">
+   <route>40 70 80 110 140 170 160 190</route>
+  </leg>
+  <act type="w" x100="000" y100="000" link="1900" start_time="00:00" dur="08:00" />
+ </plan>
+</person>
+
+</plans>

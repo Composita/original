@@ -1,0 +1,775 @@
+MODULE ComConsole;
+	IMPORT SYSTEM, 
+		Loader := ComLoader, CBC := ComBinaryCode, Runtime := ComRuntime, 
+		FileSystem := ComFileSystem, Keyboard := ComKeyboard, Basic := ComBasic, 
+		Concurrency, Output, Memory, Processors;
+	
+	TYPE
+		RawReader = OBJECT(Loader.Reader)
+			VAR 
+				address: Memory.Address;
+				position, length: LONGINT;
+				
+			PROCEDURE &InitRawReader(adr: Memory.Address; len: LONGINT);
+			BEGIN address := adr; length := len; position := 0
+			END InitRawReader;
+			
+			PROCEDURE Position(): LONGINT;
+			BEGIN RETURN position
+			END Position;
+			
+			PROCEDURE Length(): LONGINT;
+			BEGIN RETURN length
+			END Length;
+			
+			PROCEDURE Read(): CHAR;
+			VAR c: CHAR;
+			BEGIN 
+				ASSERT(position < length);
+				SYSTEM.GET(address + position, c);
+				INC(position);
+				RETURN c
+			END Read;
+		END RawReader;
+		
+		FileReader = OBJECT(Loader.Reader)
+			VAR rider: FileSystem.Rider;
+				
+			PROCEDURE &InitFileReader(r: FileSystem.Rider);
+			BEGIN rider := r
+			END InitFileReader;
+			
+			PROCEDURE Free;
+			BEGIN FileSystem.CloseFile(rider); Free^
+			END Free;
+			
+			PROCEDURE Position(): LONGINT;
+			BEGIN RETURN FileSystem.Position(rider)
+			END Position;
+			
+			PROCEDURE Length(): LONGINT;
+			BEGIN RETURN FileSystem.FileLength(rider)
+			END Length;
+			
+			PROCEDURE Read(): CHAR;
+			VAR c: CHAR;
+			BEGIN 
+				ASSERT(~FileSystem.EOF(rider));
+				FileSystem.Read(rider, c);
+				RETURN c
+			END Read;
+		END FileReader;
+		
+		LoadSource = POINTER TO RECORD
+			isComponent: BOOLEAN;
+			name: Basic.String;
+			address: Memory.Address;
+			length: LONGINT
+		END;
+				
+		LoadSourceList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS LoadSource); Add^(x)
+			END Add;
+			
+			PROCEDURE GetLoadSource(index: LONGINT): LoadSource;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(LoadSource)
+			END GetLoadSource;
+			
+			(* NIL if not present *)
+			PROCEDURE FindLoadSource(isComponent: BOOLEAN; name: ARRAY OF CHAR): LoadSource;
+			VAR i: LONGINT; x: LoadSource;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetLoadSource(i);
+					IF (x.isComponent = isComponent) & (x.name^ = name) THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindLoadSource;
+		END LoadSourceList;
+		
+	CONST
+		InputCacheSize = 16;
+	
+	TYPE
+		Text = ARRAY 256 OF CHAR;
+		
+		Input = RECORD
+			text: Text;
+			length: LONGINT
+		END;
+		
+		InputCache = RECORD
+			lines: ARRAY InputCacheSize OF Input;
+			in, scroll: LONGINT
+		END;
+	
+	VAR
+		lock: Concurrency.WaitLock;
+		error: BOOLEAN;
+		loadSources: LoadSourceList;
+		input: Input;
+		inputCache: InputCache;
+	
+	PROCEDURE LinkerRegisterDefaultPartition*(name: ARRAY OF CHAR);
+	BEGIN
+		Runtime.FinalizeLog;
+		FileSystem.Mount(name);
+		FileSystem.SetDefaultVolume(name);
+		Runtime.InitializeLog
+	END LinkerRegisterDefaultPartition;
+	
+	PROCEDURE LinkerLoadLastPartition*;
+	BEGIN Runtime.FinalizeLog; FileSystem.LoadLastVolume; Runtime.InitializeLog
+	END LinkerLoadLastPartition;
+	
+	PROCEDURE LinkerRegisterLoadSource*(isComponent: BOOLEAN; name: ARRAY OF CHAR; 
+		address: Memory.Address; length: LONGINT);
+	VAR x: LoadSource;
+	BEGIN
+		NEW(x); x.isComponent := isComponent; x.name := Basic.NewString(name); x.address := address; x.length := length;
+		loadSources.Add(x)
+	END LinkerRegisterLoadSource;
+
+	PROCEDURE LinkerCreateComponent*(instanceId, type: ARRAY OF CHAR);
+	BEGIN CreateComponent(instanceId, type)
+	END LinkerCreateComponent;
+	
+	PROCEDURE LinkerConnectComponents*(interfaceName, sourceInstanceName, targetInstanceName: ARRAY OF CHAR);
+	BEGIN Connect(interfaceName, sourceInstanceName, -1, targetInstanceName)
+	END LinkerConnectComponents;
+	
+	PROCEDURE LinkerLoadSystemComponent*;
+	BEGIN
+		Lock;
+		Load(FALSE, FALSE, Runtime.SystemTimeInterfaceName);
+		Load(FALSE, FALSE, Runtime.FileSystemInterfaceName);
+		Load(FALSE, FALSE, Runtime.GraphicViewInterfaceName);
+		Runtime.CreateSystemComponent;
+		Unlock
+	END LinkerLoadSystemComponent;
+	
+	(* Load with cyclic dependencies *)
+	PROCEDURE Load(isComponent: BOOLEAN; output: BOOLEAN; name: ARRAY OF CHAR);
+	VAR usedInterface, loadedInterface: Runtime.InterfaceSpecification; 
+		usedComponent: Loader.UsedComponent; loadedComponent: Loader.NewComponent; 
+		installedComponent: Runtime.ComponentTemplate;
+	BEGIN
+		ASSERT(Concurrency.IsLocked(lock));
+		error := FALSE;
+		IF (isComponent & (Runtime.FindComponentTemplate(name) # NIL)) OR 
+			(~isComponent & (Runtime.FindInterfaceSpecification(name) # NIL)) THEN
+			Error2(name, " already loaded")
+		ELSE
+			IF output THEN Basic.OutText("Loading"); Basic.OutLine END;
+			Loader.Initialize;
+			PreLoad(isComponent, output, name);
+						
+			WHILE ~IsError() & ((Loader.usedInterfaces.Length() > 0) OR (Loader.usedComponents.Length() > 0)) DO
+				IF Loader.usedInterfaces.Length() > 0 THEN
+					usedInterface := Loader.usedInterfaces.GetInterfaceSpecification(0);
+					Loader.usedInterfaces.Remove(usedInterface);
+					loadedInterface := Runtime.FindInterfaceSpecification(usedInterface.name^);
+					IF loadedInterface = NIL THEN
+						loadedInterface := Loader.newInterfaces.FindInterfaceSpecification(usedInterface.name^);
+						IF loadedInterface = NIL THEN
+							PreLoad(FALSE, output, usedInterface.name^);
+							loadedInterface := Loader.newInterfaces.FindInterfaceSpecification(usedInterface.name^)
+						END
+					END;
+					IF ~IsError() & ~usedInterface.Equal(loadedInterface) THEN
+						Error2("Incompatible used interface ", usedInterface.name^)
+					END;
+					loadedInterface := NIL;
+					usedInterface.Free; DELETE(usedInterface)
+				ELSE
+					usedComponent := Loader.usedComponents.GetUsedComponent(0);
+					Loader.usedComponents.Remove(usedComponent);
+					installedComponent := Runtime.FindComponentTemplate(usedComponent.name^);
+					IF installedComponent # NIL THEN
+						IF ~usedComponent.Compatible1(installedComponent) THEN
+							Error2("Incompatible used component ", usedComponent.name^)
+						END
+					ELSE
+						loadedComponent := Loader.newComponents.FindNewComponent(usedComponent.name^);
+						IF loadedComponent = NIL THEN
+							PreLoad(TRUE, output, usedComponent.name^);
+							loadedComponent := Loader.newComponents.FindNewComponent(usedComponent.name^)
+						END;
+						IF ~IsError() & ~usedComponent.Compatible2(loadedComponent) THEN
+							Error2("Incompatible used component ", usedComponent.name^)
+						END
+					END;
+					installedComponent := NIL; loadedComponent := NIL;
+					usedComponent.Free; DELETE(usedComponent)
+				END
+			END;
+			IF ~IsError() THEN 
+				Loader.Commit;
+				IF output THEN Basic.OutText("done") END
+			ELSE 
+				Loader.Abort;
+				IF output THEN Basic.OutText("failed") END
+			END;
+			IF output THEN Basic.OutLine END
+		END
+	END Load;
+	
+	PROCEDURE PreLoad(isComponent: BOOLEAN; output: BOOLEAN; name: ARRAY OF CHAR);
+	VAR reader: Loader.Reader;
+	BEGIN
+		ASSERT(Concurrency.IsLocked(lock));
+		reader := OpenReader(isComponent, name);
+		IF output THEN
+			IF isComponent THEN Basic.OutText(" component ") ELSE Basic.OutText(" interface ") END;
+			Basic.OutText(name); Basic.OutLine
+		END;
+		IF reader # NIL THEN 
+			Loader.PreLoad(name, reader);
+			reader.Free; DELETE(reader)
+		ELSE
+			Error("Program code can not be loaded")
+		END
+	END PreLoad;
+	
+	PROCEDURE IsError(): BOOLEAN;
+	BEGIN RETURN error OR Loader.error
+	END IsError;
+	
+	PROCEDURE Error(x: ARRAY OF CHAR);
+	BEGIN Error4(x, "", "", "")
+	END Error;
+	
+	PROCEDURE Error2(x, y: ARRAY OF CHAR);
+	BEGIN Error4(x, y, "", "")
+	END Error2;
+	
+	PROCEDURE Error3(x, y, z: ARRAY OF CHAR);
+	BEGIN Error4(x, y, z, "")
+	END Error3;
+
+	PROCEDURE Error4(a, b, c, d: ARRAY OF CHAR);
+	BEGIN 
+		Basic.OutText("Error: "); Basic.OutText(a); Basic.OutText(b); Basic.OutText(c); Basic.OutText(d); Basic.OutLine; 
+		error := TRUE
+	END Error4;
+
+	(* NIL if not defined *)
+	PROCEDURE OpenReader(isComponent: BOOLEAN; name: ARRAY OF CHAR): Loader.Reader;				
+	VAR x: LoadSource; rawReader: RawReader; filename: FileSystem.FileName; rider: FileSystem.Rider; ok: BOOLEAN;
+		fileReader: FileReader;
+	BEGIN 
+		ASSERT(Concurrency.IsLocked(lock));
+		x := loadSources.FindLoadSource(isComponent, name);
+		IF x # NIL THEN
+			NEW(rawReader, x.address, x.length);
+			RETURN rawReader;
+		ELSE
+			COPY(name, filename); Append(filename, "."); Append(filename, CBC.FileSuffix);
+			FileSystem.OpenFile(filename, rider, ok);
+			IF ok THEN 
+				NEW(fileReader, rider);
+				RETURN fileReader
+			END
+		END;
+		RETURN NIL
+	END OpenReader;
+
+	PROCEDURE Append(VAR x: ARRAY OF CHAR; app: ARRAY OF CHAR);
+	VAR i, k: LONGINT; 
+	BEGIN
+		i := 0; WHILE (i < LEN(x)) & (x[i] # 0X) DO INC(i) END; ASSERT(i < LEN(x));
+		k := 0; WHILE (k < LEN(app)) & (app[k] # 0X) DO x[i] := app[k]; INC(i); INC(k) END;
+		IF i < LEN(x) THEN x[i] := 0X END
+	END Append;
+		
+	PROCEDURE Execute*;
+		VAR pos: LONGINT; c: CHAR; command, instance, type, interface, from, to, message, volume, text: Text; 
+			fromIndex, number: LONGINT; parameters: Runtime.ParameterList;
+		
+		PROCEDURE NextChar;
+		BEGIN
+			IF (pos < LEN(input.text)) & (c # 0X) THEN 
+				c := input.text[pos]; INC(pos)
+			END
+		END NextChar;
+		
+		PROCEDURE InitInput;
+		BEGIN c := input.text[0]; pos := 1
+		END InitInput;
+
+		PROCEDURE SkipWhiteSpaces;
+		BEGIN WHILE (c # 0X) & (c <= " ") DO NextChar END
+		END SkipWhiteSpaces;
+
+		PROCEDURE ParseIdentifier(VAR x: Text);
+		VAR i: LONGINT; 
+		BEGIN
+			x := "";
+			SkipWhiteSpaces;
+			i := 0; 
+			IF IsLetter() THEN
+				REPEAT
+					x[i] := c; INC(i); NextChar 
+				UNTIL ~IsLetter() & ~IsNumber()
+			ELSE Error("Identifier expected")
+			END;
+			x[i] := 0X
+		END ParseIdentifier;
+		
+		PROCEDURE ParseVolumeName(VAR x: Text);
+		VAR i: LONGINT;
+		BEGIN
+			x := "";
+			SkipWhiteSpaces;
+			i := 0;
+			IF IsLetter() THEN
+				REPEAT
+					x[i] := c; INC(i); NextChar
+				UNTIL ~IsLetter() & ~IsNumber() & (c # "#")
+			ELSE Error("volume identifier expected")
+			END;
+			x[i] := 0X
+		END ParseVolumeName;
+		
+		PROCEDURE ParseToken(VAR x: CHAR);
+		BEGIN SkipWhiteSpaces; x := c; NextChar
+		END ParseToken;
+		
+		PROCEDURE CheckToken(x: CHAR);
+		VAR y: CHAR;
+		BEGIN
+			ParseToken(y); 
+			IF x # y THEN
+				Basic.OutText("'"); Basic.OutCharacter(x); Basic.OutCharacter("'"); Basic.OutText(" expected "); 
+				IF y # 0X THEN Basic.OutText(" instead of '"); Basic.OutCharacter(y); Basic.OutCharacter("'") END;
+				Basic.OutLine
+			END
+		END CheckToken;
+		
+		PROCEDURE ParseText(VAR x: ARRAY OF CHAR);
+		VAR i: LONGINT;
+		BEGIN
+			x := "";
+			IF c = 22X THEN
+				NextChar;
+				i := 0; WHILE (c # 0X) & (c # 22X) DO x[i] := c; INC(i); NextChar END;
+				x[i] := 0X;
+				IF c = 22X THEN NextChar
+				ELSE Basic.OutCharacter(22X); Basic.OutText(" missing"); Basic.OutLine
+				END
+			ELSE
+				Basic.OutCharacter(22X); Basic.OutText(" missing"); Basic.OutLine
+			END
+		END ParseText;
+		
+		PROCEDURE IsToken(x: CHAR): BOOLEAN;
+		BEGIN SkipWhiteSpaces; RETURN x = c
+		END IsToken;
+		
+		PROCEDURE IsLetter(): BOOLEAN;
+		BEGIN RETURN ((c >= "A") & (c <= "Z")) OR ((c >= "a") & (c <= "z"))
+		END IsLetter;
+		
+		PROCEDURE IsNumber(): BOOLEAN;
+		BEGIN RETURN (c >= "0") & (c <= "9")
+		END IsNumber;
+		
+		PROCEDURE IsEnd(): BOOLEAN;
+		BEGIN RETURN (c = 0X) OR error
+		END IsEnd;
+		
+		PROCEDURE ParseInteger(VAR x: LONGINT);
+		VAR a: Text; i: LONGINT;
+		BEGIN
+			i := 0; WHILE IsNumber() DO a[i] := c; INC(i); NextChar END; a[i] := 0X;
+			Basic.TextToInteger(a, x)
+		END ParseInteger;				
+	BEGIN
+		ASSERT(Concurrency.IsLocked(lock));
+		InitInput;
+		error := FALSE;
+		REPEAT
+			WHILE IsToken(";") DO NextChar END;
+			IF ~IsEnd() THEN
+				ParseIdentifier(command);
+				IF command = "NEW" THEN
+					CheckToken("("); ParseIdentifier(instance); CheckToken(","); ParseIdentifier(type); CheckToken(")");
+					CreateComponent(instance, type)
+				ELSIF command = "CONNECT" THEN
+					CheckToken("("); ParseIdentifier(interface); 
+					IF IsToken("[") THEN 
+						NextChar; 
+						IF IsNumber() THEN ParseInteger(fromIndex) ELSE Error("integer index required") END;
+						CheckToken("]")
+					ELSE fromIndex := -1
+					END;
+					CheckToken("("); ParseIdentifier(from); CheckToken(")");
+					CheckToken(","); ParseIdentifier(to); CheckToken(")");
+					Connect(interface, from, fromIndex, to)
+				ELSIF command = "DISCONNECT" THEN
+					CheckToken("("); ParseIdentifier(interface);
+					IF IsToken("[") THEN 
+						NextChar; 
+						IF IsNumber() THEN ParseInteger(fromIndex) ELSE Error("integer index required") END;
+						CheckToken("]")
+					ELSE fromIndex := -1
+					END;
+					CheckToken("("); ParseIdentifier(from); CheckToken(")");
+					CheckToken(")");
+					Disconnect(interface, from, fromIndex)
+				ELSIF command = "DELETE" THEN
+					CheckToken("("); ParseIdentifier(instance); CheckToken(")");
+					DeleteComponent(instance)
+				ELSIF command = "SHOW" THEN
+					ParseIdentifier(command); 
+					IF command = "RESOURCES" THEN
+						ShowResources
+					ELSIF command = "COMPONENTS" THEN
+						ShowComponents
+					ELSIF command = "FILES" THEN
+						ShowFiles
+					ELSIF command = "VOLUMES" THEN
+						ShowVolumes
+					ELSE
+						Basic.OutText("Undefined command SHOW "); Basic.OutText(command); Basic.OutLine
+					END
+				ELSIF command = "SET" THEN
+					ParseIdentifier(command);
+					IF command = "DEFAULT" THEN
+						ParseVolumeName(volume);
+						FileSystem.SetDefaultVolume(volume)
+					ELSIF command = "MODE" THEN
+						ParseIdentifier(command);
+						IF command = "SERIAL" THEN
+							Runtime.SetSchedulerMode(Concurrency.SerialMode)
+						ELSIF command = "PARALLEL" THEN
+							Runtime.SetSchedulerMode(Concurrency.ParallelMode)
+						ELSIF command = "SMART" THEN
+							Runtime.SetSchedulerMode(Concurrency.SemiParallelMode)
+						ELSE 
+							Basic.OutText("Mode must be SERIAL, PARALLEL or SMART"); Basic.OutLine
+						END
+					ELSE Basic.OutText("Undefined command SET "); Basic.OutText(command); Basic.OutLine
+					END
+				ELSIF command = "MOUNT" THEN
+					ParseVolumeName(volume);
+					Mount(volume)
+				ELSIF command = "UNMOUNT" THEN
+					ParseVolumeName(volume);
+					Unmount(volume)
+				ELSE
+					IF IsToken("(") THEN
+						interface := command;
+						CheckToken("("); ParseIdentifier(instance); CheckToken(")")
+					ELSE
+						instance := command; interface := ""
+					END;
+					IF IsToken("!") THEN
+						NextChar;
+						ParseIdentifier(message); NEW(parameters);
+						IF IsToken("(") THEN
+							NextChar;
+							WHILE ~IsEnd() & ~IsToken(")") DO
+								IF IsNumber() THEN
+									ParseInteger(number); parameters.AddInteger(number)
+								ELSIF IsToken(22X) THEN
+									ParseText(text); parameters.AddText(text)
+								ELSE
+									NextChar; Basic.OutText("Undefined argument"); Basic.OutLine
+								END;
+								IF ~IsEnd() & ~IsToken(")") THEN
+									CheckToken(",")
+								END
+							END;
+							CheckToken(")")
+						END;
+						Send(instance, interface, message, parameters);
+						parameters := NIL
+					ELSIF IsToken("?") THEN
+						NextChar;
+						ParseIdentifier(message);
+						Receive(instance, interface, message)
+					ELSE Basic.OutText("Undefined command "); Basic.OutText(command); Basic.OutLine
+					END;
+					SkipWhiteSpaces;
+					IF ~IsEnd() & ~IsToken(";") THEN Basic.OutText("';' missing"); Basic.OutLine END
+				END
+			END
+		UNTIL IsEnd() OR IsError()
+	END Execute;
+	
+	PROCEDURE CreateComponent(instance, type: ARRAY OF CHAR);
+	VAR template: Runtime.ComponentTemplate; task: Runtime.CreateComponentTask;
+	BEGIN
+		template := Runtime.FindComponentTemplate(type);
+		IF template = NIL THEN 
+			Load(TRUE, TRUE, type);
+			template := Runtime.FindComponentTemplate(type)
+		END;
+		IF template # NIL THEN
+			NEW(task, instance, template); Runtime.StartSystemTask(task)
+		END
+	END CreateComponent;
+			
+	PROCEDURE DeleteComponent(instance: ARRAY OF CHAR);
+	VAR task: Runtime.DeleteComponentTask;
+	BEGIN NEW(task, instance); Runtime.StartSystemTask(task)
+	END DeleteComponent;
+	
+	PROCEDURE Connect(interfaceName, fromInstance: ARRAY OF CHAR; fromIndex: LONGINT; toInstance: ARRAY OF CHAR);
+	VAR task: Runtime.ConnectComponentsTask; interface: Runtime.InterfaceSpecification;
+	BEGIN 
+		interface := Runtime.FindInterfaceSpecification(interfaceName);
+		IF interface # NIL THEN
+			NEW(task, interface, fromInstance, fromIndex, toInstance); Runtime.StartSystemTask(task)
+		ELSE Error3("Interface ", interfaceName, " not loaded")
+		END
+	END Connect;
+	
+	PROCEDURE Disconnect(interfaceName, instance: ARRAY OF CHAR; index: LONGINT);
+	VAR task: Runtime.DisconnectTask; interface: Runtime.InterfaceSpecification;
+	BEGIN
+		interface := Runtime.FindInterfaceSpecification(interfaceName);
+		IF interface # NIL THEN
+			NEW(task, interface, instance, index); Runtime.StartSystemTask(task)
+		ELSE Error3("Interface ", interfaceName, " not loaded")
+		END
+	END Disconnect;
+
+	PROCEDURE Send(instance, interfaceName, message: ARRAY OF CHAR; parameters: Runtime.ParameterList);
+	VAR task: Runtime.SendMessageTask; interface: Runtime.InterfaceSpecification; md: Runtime.MessageDeclaration;
+	BEGIN
+		interface := Runtime.FindInterfaceSpecification(interfaceName);
+		IF interface # NIL THEN
+			md := interface.messageDeclarations.FindMessageDeclaration(message);
+			IF md # NIL THEN
+				IF ParameterCompatible(parameters, md.parameterTypes) THEN
+					NEW(task, interface, instance, md, parameters); Runtime.StartSystemTask(task)
+				END
+			ELSE Error2("Undefined message ", message)
+			END
+		ELSE Error3("Interface ", interfaceName, " not loaded")
+		END
+	END Send;
+	
+	PROCEDURE Receive(instance, interfaceName, message: ARRAY OF CHAR);
+	VAR task: Runtime.ReceiveMessageTask; interface: Runtime.InterfaceSpecification; md: Runtime.MessageDeclaration;
+	BEGIN
+		interface := Runtime.FindInterfaceSpecification(interfaceName);
+		IF interface # NIL THEN
+			md := interface.messageDeclarations.FindMessageDeclaration(message);
+			IF md # NIL THEN
+				NEW(task, interface, instance, md); Runtime.StartSystemTask(task)
+			ELSE Error2("Undefined message ", message)
+			END
+		ELSE Error3("Interface ", interfaceName, " not loaded")
+		END
+	END Receive;
+	
+	PROCEDURE ParameterCompatible(args: Runtime.ParameterList; pars: Runtime.TypeList): BOOLEAN;
+	VAR i: LONGINT; expr: Runtime.Parameter; type: LONGINT; charPar: Runtime.CharacterParameter; str: Basic.String;
+	BEGIN
+		IF args.Length() = pars.Length() THEN
+			FOR i := 0 TO args.Length()-1 DO
+				expr := args.GetParameter(i); type := pars.GetItem(i);
+				IF type = Runtime.CharacterTypeCode THEN
+					IF (expr IS Runtime.TextParameter) THEN
+						str := expr(Runtime.TextParameter).value;
+						IF (str # NIL) & ((LEN(str) = 1) OR ((LEN(str) >= 2) & (str[1] = 0X))) THEN
+							NEW(charPar, expr(Runtime.TextParameter).value[0]);
+							args.ReplaceByIndex(i, charPar); 
+							str := NIL; expr.Free; DELETE(expr);
+							expr := charPar
+						END
+					END;
+					IF ~(expr IS Runtime.CharacterParameter) THEN
+						Error("Invalid parameter type"); RETURN FALSE
+					END
+				ELSIF type = Runtime.BooleanTypeCode THEN
+					Error("Boolean parameter not supported"); RETURN FALSE
+				ELSIF type = Runtime.IntegerTypeCode THEN
+					IF ~(expr IS Runtime.IntegerParameter) THEN
+						Error("Invalid parameter type"); RETURN FALSE
+					END
+				ELSIF type = Runtime.RealTypeCode THEN
+					Error("Real parameter not supported"); RETURN FALSE
+				ELSIF type = Runtime.TextTypeCode THEN
+					IF ~(expr IS Runtime.TextParameter) THEN
+						Error("Invalid parameter type"); RETURN FALSE
+					END
+				ELSIF type = Runtime.ComponentTypeCode THEN
+					Error("Component parameters not supported"); RETURN FALSE
+				ELSE HALT(111)
+				END
+			END;
+			RETURN TRUE
+		ELSE 
+			IF args.Length() < pars.Length() THEN Error("Too few parameters") ELSE Error("Too many parameters") END;
+			RETURN FALSE
+		END
+	END ParameterCompatible;
+			
+	PROCEDURE ShowResources;
+	BEGIN Runtime.ShowResources
+	END ShowResources;
+	
+	PROCEDURE ShowComponents;
+	BEGIN Runtime.ShowComponents
+	END ShowComponents;
+	
+	PROCEDURE ShowVolumes*;
+	VAR a: ARRAY FileSystem.MaxVolumes OF FileSystem.VolumeName; d: FileSystem.VolumeName; i: LONGINT;
+	BEGIN
+		FileSystem.ListVolumes(a, d);
+		Output.Text("Volumes: "); Output.Line;
+		i := 0; 
+		WHILE (i < LEN(a)) & (a[i] # "") DO 
+			Output.Text("  "); Output.Text(a[i]); 
+			IF a[i] = d THEN Output.Text(" DEFAULT") END;
+			Output.Line;
+			INC(i)
+		END
+	END ShowVolumes;
+	
+	PROCEDURE ShowFiles*;
+	VAR volumeName: Text; list: FileSystem.FileEntryList; i: LONGINT; entry: FileSystem.FileEntry;
+	BEGIN
+		FileSystem.GetDefaultVolume(volumeName);
+		list := FileSystem.ListDirectory(volumeName, FALSE);
+		IF list # NIL THEN
+			Output.Text("Files on default volume "); Output.Text(volumeName); Output.Text(":"); Output.Line;
+			FOR i := 0 TO list.Length()-1 DO
+				list.Get(i, entry); Output.Text("  "); Output.Text(entry.name); Output.Line
+			END;
+			list.Free;
+			DELETE(list)
+		ELSE Output.Text("No volume loaded")
+		END
+	END ShowFiles;
+	
+	PROCEDURE Mount(name: ARRAY OF CHAR);
+	BEGIN FileSystem.Mount(name)
+	END Mount;
+	
+	PROCEDURE Unmount(name: ARRAY OF CHAR);
+	BEGIN Runtime.FinalizeLog; FileSystem.Unmount(name); Runtime.InitializeLog
+	END Unmount;
+
+	PROCEDURE Reboot;
+	BEGIN
+		Runtime.FinalizeLog;
+		FileSystem.Cleanup;
+		Processors.Reboot;
+		HALT(80) (* unreachable *)
+	END Reboot;
+
+	PROCEDURE KeyPressed(flags: SET; key: Keyboard.Key);
+	CONST 
+		InputDisplayNumber = 1;
+		StackExtensionSize = 64*Memory.KB;
+	BEGIN
+		Lock;
+		IF (key.special = Keyboard.Delete) & (flags * {Keyboard.LeftAlt, Keyboard.RightAlt} # {}) &
+				(flags * {Keyboard.LeftCtrl, Keyboard.RightCtrl} # {}) THEN
+			Reboot
+		ELSIF key.char # 0X THEN 
+			Output.WriteCharacter(Output.standardInput, key.char, Output.Black);
+			IF input.length < LEN(input.text) THEN
+				input.text[input.length] := key.char; INC(input.length)
+			END
+		ELSIF key.special = Keyboard.BackSpace THEN 
+			IF input.length > 0 THEN
+				Output.WriteCharacter(Output.standardInput, 009X, Output.Black);
+				DEC(input.length); input.text[input.length] := 0X 
+			END
+		ELSIF key.special = Keyboard.Up THEN
+			IF inputCache.scroll > 0 THEN
+				ClearInput;
+				DEC(inputCache.scroll); 
+				CopyInput(inputCache.lines[inputCache.scroll MOD InputCacheSize], input);
+				WriteInput
+			END
+		ELSIF key.special = Keyboard.Down THEN
+			IF inputCache.scroll < inputCache.in THEN
+				ClearInput;
+				INC(inputCache.scroll); 
+				IF inputCache.scroll # inputCache.in THEN 
+					CopyInput(inputCache.lines[inputCache.scroll MOD InputCacheSize], input);
+				END;
+				WriteInput
+			END
+		ELSIF key.special = Keyboard.Return THEN 
+			CopyInput(input, inputCache.lines[inputCache.in MOD InputCacheSize]);
+			INC(inputCache.in); inputCache.scroll := inputCache.in;
+			Output.WriteLine(Output.standardInput);
+			Execute;
+			InitializeInput
+		END;
+		Unlock
+	END KeyPressed;
+	
+	PROCEDURE CopyInput(VAR x, y: Input);
+	BEGIN COPY(x.text, y.text); y.length := x.length
+	END CopyInput;
+		
+	PROCEDURE ClearInput;
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := input.length-1 TO 0 BY -1 DO
+			input.text[i] := 0X;
+			Output.WriteCharacter(Output.standardInput, 09X, Output.Black) (* BackSpace *)
+		END;
+		input.length := 0
+	END ClearInput;
+		
+	PROCEDURE InitializeInput;
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO LEN(input.text)-1 DO input.text[i] := 0X END;
+		input.length := 0
+	END InitializeInput;
+	
+	PROCEDURE WriteInput;
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO input.length-1 DO 
+			Output.WriteCharacter(Output.standardInput, input.text[i], Output.Black)
+		END
+	END WriteInput;
+
+	PROCEDURE InitializeConsole;
+	CONST FontColor = Output.Black;
+	VAR i: LONGINT;
+	BEGIN
+		Lock;
+		Output.WriteText(Output.standardInput, "Component System (", FontColor); 
+		Output.WriteInteger(Output.standardInput, Processors.nofProcessors, FontColor); 
+		Output.WriteText(Output.standardInput, " processor", FontColor);
+		IF Processors.nofProcessors > 1 THEN Output.WriteText(Output.standardInput, "s", FontColor) END;
+		Output.WriteText(Output.standardInput, ", ", FontColor); 
+		Output.WriteCardinal(Output.standardInput, (Memory.memorySize + Memory.MB -1) DIV Memory.MB, FontColor);
+		Output.WriteText(Output.standardInput, " MB memory)", FontColor); 
+		Output.WriteLine(Output.standardInput);
+		InitializeInput;
+		FOR i := 0 TO InputCacheSize-1 DO inputCache.lines[i].length := 0 END;
+		inputCache.in := 0; inputCache.scroll := 0;
+		Keyboard.AddListener(KeyPressed);
+		Unlock
+	END InitializeConsole;
+			
+	PROCEDURE Lock;
+	BEGIN Concurrency.Lock(lock)
+	END Lock;
+
+	PROCEDURE Unlock;
+	BEGIN Concurrency.Unlock(lock)
+	END Unlock;
+		
+BEGIN 
+	Concurrency.InitializeLock(lock);
+	NEW(loadSources);
+	InitializeConsole;
+	FileSystem.Initialize
+END ComConsole.

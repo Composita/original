@@ -1,0 +1,374 @@
+MODULE ComCollections; (** Component Runtime, Generic Component Collections, 2006-2007 by Luc Blaeser *)
+	IMPORT SYSTEM, Basic := ComBasic, Memory;
+	
+	TYPE
+		Address* = Memory.Address;
+	CONST
+		NilValue* = Memory.Nil;
+		
+	CONST
+		MaxKeys* = 4;
+	TYPE
+		KeyTypeCode* = LONGINT;
+		KeyTypeCodeList* = ARRAY MaxKeys OF KeyTypeCode;
+		
+	CONST	
+		CharacterTypeCode* = 1;
+		BooleanTypeCode* = 2;
+		IntegerTypeCode* = 3;
+		RealTypeCode* = 4;
+		TextTypeCode* = 5;
+		ComponentTypeCode* = 6;
+
+		SimpleValueSize* = 8;
+		
+	TYPE
+		(** Optimization: store small key or values without need of dynamic memory allocation *)
+		Key* = ARRAY MaxKeys OF Address;
+		
+		Value* = RECORD
+			simple*: ARRAY SimpleValueSize OF CHAR; 
+			complex*: POINTER TO ARRAY OF CHAR
+		END;
+		
+	CONST
+		NoIndex = -1;
+		InitialHashSize = 5;
+		
+	TYPE
+		Entry = RECORD
+			prev, next: LONGINT; (* collision list, index in table *)
+			used: BOOLEAN;
+			key: Key;
+			value: Value
+		END;
+		
+		HashTable = POINTER TO ARRAY OF Entry;
+		
+		Collection* = OBJECT
+			VAR
+				hashTable: HashTable;
+				optimized: BOOLEAN;
+				keyTypes-: KeyTypeCodeList;
+				nofKeys-: LONGINT;
+				valueSize-: LONGINT;
+				count-: LONGINT;
+			
+			PROCEDURE &Initialize(nKeys, valSize: LONGINT; VAR keyTypeCodes: KeyTypeCodeList);
+			VAR i: LONGINT;
+			BEGIN
+				nofKeys := nKeys; valueSize := valSize; 
+				ASSERT((nofKeys > 0) & (nofKeys <= MaxKeys));
+				FOR i := 0 TO nofKeys-1 DO keyTypes[i] := keyTypeCodes[i] END;
+				optimized := (nofKeys = 1) & (keyTypes[0] = IntegerTypeCode);
+				hashTable := NewHashTable(InitialHashSize);
+				count := 0
+			END Initialize;
+		
+			PROCEDURE NewHashTable(size: LONGINT): HashTable;
+			VAR table: HashTable; i: LONGINT;
+			BEGIN
+				NEW(table, size); 
+				FOR i := 0 TO LEN(table)-1 DO
+					table[i].prev := NoIndex; 
+					table[i].next := NoIndex;
+					table[i].used := FALSE
+				END;
+				RETURN table
+			END NewHashTable;
+						
+			PROCEDURE Free*;
+			BEGIN DeleteHashTable(hashTable)
+			END Free;
+			
+			PROCEDURE DeleteHashTable(VAR table: HashTable);
+			VAR i: LONGINT;
+			BEGIN
+				FOR i := 0 TO LEN(table)-1 DO
+					IF table[i].used THEN
+						DeleteKey(table[i].key, nofKeys, keyTypes);
+						DeleteValue(table[i].value);
+						table[i].used := FALSE
+					END
+				END;
+				DELETE(table)
+			END DeleteHashTable;
+									
+			PROCEDURE CreateElement*(VAR key: Key);
+			VAR value: Value; adr: Address; i: LONGINT;
+			BEGIN 
+				INC(count);
+				IF count > LEN(hashTable) * 2 DIV 3 THEN 
+					ResizeHashTable(ImproveSize(LEN(hashTable) * 2))
+				END;
+				IF valueSize <= SimpleValueSize THEN adr := SYSTEM.ADR(value.simple[0])
+				ELSE NEW(value.complex, valueSize); adr := SYSTEM.ADR(value.complex[0])
+				END;
+				(* initialize element value *)
+				FOR i := 0 TO (valueSize DIV 4) - 1 DO
+					SYSTEM.PUT32(adr + i*4, NilValue)
+				END;
+				AddToTable(hashTable, key, value);
+				DeleteValue(value)
+			END CreateElement;
+			
+			PROCEDURE ImproveSize(size: LONGINT): LONGINT;
+			BEGIN 
+				WHILE (size MOD 2 = 0) OR (size MOD 3 = 0) OR (size MOD 5 = 0) DO INC(size) END;
+				RETURN size
+			END ImproveSize;
+			
+			PROCEDURE ExistsElement*(VAR key: Key): BOOLEAN;
+			BEGIN RETURN FindEntry(hashTable, key) # NoIndex
+			END ExistsElement;
+			
+			PROCEDURE ElementValueAddress*(VAR key: Key): Address;
+			VAR i: LONGINT;
+			BEGIN
+				i := FindEntry(hashTable, key); 
+				ASSERT(i # NoIndex, -14);
+				IF valueSize <= SimpleValueSize THEN
+					RETURN SYSTEM.ADR(hashTable[i].value.simple[0])
+				ELSE
+					RETURN SYSTEM.ADR(hashTable[i].value.complex[0])
+				END
+			END ElementValueAddress;
+			
+			PROCEDURE RemoveElement*(VAR key: Key);
+			BEGIN 
+				RemoveFromTable(hashTable, key);
+				DEC(count);
+				IF (count > InitialHashSize) & (count < LEN(hashTable) DIV 3) THEN 
+					ResizeHashTable(ImproveSize(LEN(hashTable) DIV 2))
+				END
+			END RemoveElement;
+			
+			PROCEDURE IterationStart*(): LONGINT;
+			BEGIN RETURN IterationStartInTable(hashTable)
+			END IterationStart;
+			
+			PROCEDURE IterationContinue*(rider: LONGINT): BOOLEAN;
+			BEGIN RETURN IterationContinueInTable(hashTable, rider)
+			END IterationContinue;
+			
+			PROCEDURE IterationGetKey*(rider: LONGINT; VAR key: Key);
+			BEGIN IterationGetKeyInTable(hashTable, rider, key)
+			END IterationGetKey;
+			
+			PROCEDURE IterationGetValueAddress*(rider: LONGINT): Address;
+			BEGIN RETURN IterationGetValAdrInTable(hashTable, rider)
+			END IterationGetValueAddress;
+			
+			PROCEDURE IterationNext*(VAR rider: LONGINT);
+			BEGIN IterationNextInTable(hashTable, rider)
+			END IterationNext;
+			
+			PROCEDURE ResizeHashTable(size: LONGINT);
+			VAR old, new: HashTable; i: LONGINT;
+			BEGIN
+				old := hashTable; new := NewHashTable(size);
+				FOR i := 0 TO LEN(old)-1 DO
+					IF old[i].used THEN
+						AddToTable(new, old[i].key, old[i].value)
+					END
+				END;
+				hashTable := new;
+				DeleteHashTable(old)
+			END ResizeHashTable;
+						
+			PROCEDURE IterationStartInTable(table: HashTable): LONGINT;
+			VAR i: LONGINT;
+			BEGIN 
+				i := 0; WHILE (i < LEN(table)) & ~table[i].used DO INC(i) END;
+				RETURN i
+			END IterationStartInTable;
+			
+			PROCEDURE IterationContinueInTable(table: HashTable; rider: LONGINT): BOOLEAN;
+			BEGIN RETURN rider < LEN(table)
+			END IterationContinueInTable;
+			
+			PROCEDURE IterationGetKeyInTable(table: HashTable; rider: LONGINT; VAR key: Key);
+			BEGIN 
+				ASSERT(table[rider].used);
+				CopyKey(table[rider].key, key, nofKeys, keyTypes)
+			END IterationGetKeyInTable;
+			
+			PROCEDURE IterationGetValAdrInTable(table: HashTable; rider: LONGINT): Address;
+			BEGIN
+				ASSERT(table[rider].used);
+				IF valueSize <= SimpleValueSize THEN
+					RETURN SYSTEM.ADR(table[rider].value.simple[0])
+				ELSE
+					RETURN SYSTEM.ADR(table[rider].value.complex[0])
+				END
+			END IterationGetValAdrInTable;
+			
+			PROCEDURE IterationNextInTable(table: HashTable; VAR rider: LONGINT);
+			BEGIN REPEAT INC(rider) UNTIL (rider >= LEN(table)) OR table[rider].used
+			END IterationNextInTable;
+			
+			PROCEDURE AddToTable(table: HashTable; VAR key: Key; VAR value: Value);
+			VAR i, free: LONGINT; foreign: BOOLEAN;
+			BEGIN 
+				i := HashIndex(table, key);
+				IF table[i].used THEN
+					foreign := table[i].prev # NoIndex;
+					free := FindFreeIndex(table, i);
+					RelocateEntry(table, i, free);
+					IF ~foreign THEN
+						table[i].next := free;
+						table[free].prev := i
+					END
+				END;
+				table[i].used := TRUE;
+				CopyKey(key, table[i].key, nofKeys, keyTypes);
+				CopyValue(value, table[i].value)
+			END AddToTable;
+			
+			PROCEDURE RemoveFromTable(table: HashTable; VAR key: Key);
+			VAR i, prev, next: LONGINT;
+			BEGIN
+				i := FindEntry(table, key); 
+				ASSERT(i # NoIndex, -14);
+				prev := table[i].prev; table[i].prev := NoIndex;
+				next := table[i].next; table[i].next := NoIndex;
+				DeleteKey(table[i].key, nofKeys, keyTypes);
+				DeleteValue(table[i].value);
+				table[i].used := FALSE;
+				IF prev # NoIndex THEN 
+					table[prev].next := next
+				END;
+				IF next # NoIndex THEN
+					table[next].prev := prev
+				END;
+				IF (prev = NoIndex) & (next # NoIndex) THEN
+					RelocateEntry(table, next, i)
+				END
+			END RemoveFromTable;
+			
+			PROCEDURE RelocateEntry(table: HashTable; from, to: LONGINT);
+			VAR prev, next: LONGINT;
+			BEGIN
+				prev := table[from].prev; next := table[from].next;
+				table[to] := table[from]; 
+				IF prev # NoIndex THEN table[prev].next := to END;
+				IF next # NoIndex THEN table[next].prev := to END;
+				table[from].used := FALSE;
+				table[from].prev := NoIndex; 
+				table[from].next := NoIndex
+			END RelocateEntry;
+			
+			PROCEDURE FindFreeIndex(table: HashTable; start: LONGINT): LONGINT;
+			VAR i: LONGINT;
+			BEGIN
+				start := i; 
+				REPEAT 
+					i := (i+1) MOD LEN(table) 
+				UNTIL (i = start) OR ~table[i].used;
+				ASSERT(i # start); 
+				RETURN i
+			END FindFreeIndex;
+			
+			PROCEDURE HashIndex(table: HashTable; VAR key: Key): LONGINT;
+			VAR x: LONGINT; s: Basic.String;
+			BEGIN
+				x := SYSTEM.VAL(LONGINT, key[0]);
+				IF keyTypes[0] = TextTypeCode THEN
+					s := SYSTEM.VAL(Basic.String, key[0]);
+					IF s = NIL THEN x := 0 ELSE x := ORD(s[0]) END
+				END;
+				RETURN x MOD LEN(table)
+			END HashIndex;
+			
+			PROCEDURE FindEntry(table: HashTable; VAR key: Key): LONGINT;
+			VAR i: LONGINT;
+			BEGIN
+				i := HashIndex(table, key);
+				WHILE (i # NoIndex) & table[i].used & ~Equal(table[i].key, key) DO i := table[i].next END;
+				IF (i # NoIndex) & table[i].used THEN RETURN i 
+				ELSE RETURN NoIndex
+				END
+			END FindEntry;
+			
+			PROCEDURE Equal(VAR a, b: Key): BOOLEAN;
+			VAR i: LONGINT; 
+			BEGIN
+				IF optimized THEN RETURN SYSTEM.VAL(LONGINT, a[0]) = SYSTEM.VAL(LONGINT, b[0]) END;
+				FOR i := 0 TO nofKeys-1 DO
+					IF (keyTypes[i] = CharacterTypeCode) OR (keyTypes[i] = BooleanTypeCode) THEN
+						IF CHR(SYSTEM.VAL(LONGINT, a[i])) # CHR(SYSTEM.VAL(LONGINT, b[i])) THEN RETURN FALSE END
+					ELSIF keyTypes[i] = IntegerTypeCode THEN
+						IF SYSTEM.VAL(LONGINT, a[i]) # SYSTEM.VAL(LONGINT, b[i]) THEN RETURN FALSE END
+					ELSIF keyTypes[i] = RealTypeCode THEN
+						IF SYSTEM.VAL(REAL, a[i]) # SYSTEM.VAL(REAL, b[i]) THEN RETURN FALSE END
+					ELSIF keyTypes[i] = TextTypeCode THEN
+						IF ~EqualText(SYSTEM.VAL(Basic.String, a[i]), SYSTEM.VAL(Basic.String, b[i])) THEN RETURN FALSE END
+					ELSE HALT(111)
+					END
+				END;
+				RETURN TRUE
+			END Equal;
+		END Collection;
+		
+	PROCEDURE CopyValue(from: Value; VAR to: Value);
+	VAR i: LONGINT;
+	BEGIN
+		to.simple := from.simple;
+		IF from.complex # NIL THEN
+			NEW(to.complex, LEN(from.complex));
+			FOR i := 0 TO LEN(from.complex)-1 DO
+				to.complex[i] := from.complex[i]
+			END
+		END
+	END CopyValue;
+		
+	PROCEDURE DeleteValue(VAR value: Value);
+	BEGIN 
+		IF value.complex # NIL THEN 
+			DELETE(value.complex)
+		END
+	END DeleteValue;
+		
+	PROCEDURE EqualText(a, b: Basic.String): BOOLEAN;
+	VAR r: BOOLEAN;
+	BEGIN
+		IF (a # NIL) & (b # NIL) THEN r := a^ = b^
+		ELSIF a = NIL  THEN r := (b = NIL) OR (b^ = "")
+		ELSE r := a^ = ""
+		END;
+		RETURN r
+	END EqualText;
+		
+	PROCEDURE CopyKey(VAR from, to: Key; nofKeys: LONGINT; VAR keyTypes: KeyTypeCodeList);
+	VAR i: LONGINT; s: Basic.String;
+	BEGIN
+		FOR i := 0 TO nofKeys-1 DO
+			ASSERT(keyTypes[i] # ComponentTypeCode);
+			IF keyTypes[i] = TextTypeCode THEN
+				s := SYSTEM.VAL(Basic.String, from[i]);
+				IF s # NIL THEN 
+					IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofTexts) END;
+					s := Basic.CopyString(s) 
+				END;
+				to[i] := SYSTEM.VAL(Address, s)
+			ELSE
+				to[i] := from[i]
+			END
+		END
+	END CopyKey;
+
+	PROCEDURE DeleteKey(VAR key: Key; nofKeys: LONGINT; VAR keyTypes: KeyTypeCodeList);
+	VAR i: LONGINT; s: Basic.String;
+	BEGIN
+		FOR i := 0 TO nofKeys-1 DO
+			ASSERT(keyTypes[i] # ComponentTypeCode);
+			IF keyTypes[i] = TextTypeCode THEN
+				s := SYSTEM.VAL(Basic.String, key[i]); key[i] := NilValue;
+				IF s # NIL THEN
+					IF Basic.StatisticsEnabled THEN Basic.AtomicDec(Basic.statistics.nofTexts) END;
+					DELETE(s) 
+				END
+			END
+		END
+	END DeleteKey;
+END ComCollections.

@@ -1,0 +1,415 @@
+MODULE Heap; (** Kernel, Heap Memory, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Interrupts, Memory, Processors;
+	
+	CONST ReferenceCounting = FALSE; (* only for test purposes *)
+	
+	(**
+		Heap implementation:
+		* Segregated free lists for blocks of certain size range (last collective list for huge blocks)
+		* Neighbour block information (size at the head and tail of block) for fast merge on de-allocation
+		Features:
+		+ Constant allocation and de-allocation time (except huge blocks in last free list)
+		+ Reduced external fragmentation (with merge)
+		+ No internal fragmentation
+		*)
+
+	(* 
+		Generic block layout:
+		F: free flag encoded in bit 0 of block size (F=0: occupied, F=1: free)
+		 
+		       occupied block: 										  free block:
+  	    0   -------------------------			0   --------------------------
+  	         |                size			 | F = 0  |			    |                 size    		   | F = 1 |
+          4   -------------------------			4   --------------------------
+  		     |                use data       	      |				| pointer to previous free block |
+  			 |  								        	 | 		  8   --------------------------
+  			 |   								            |				| pointer to next free block       |
+  	  	   |										   	|        12    --------------------------
+  			 |   			  			     		     |				| 				free 						 |
+    size-4 -------------------------	 size-4  --------------------------
+  			 |				size  					   |				|                 size					       |
+       size  -------------------------        size   --------------------------
+       																		
+    *)
+     
+	CONST
+		KB = Memory.KB; MB = Memory.MB;
+	
+		MinimumBlockSize = 16; (* minimum free block size >= 16 *)
+		NofFreeLists = 16;
+	
+		MinAlignment = MinimumBlockSize; (* for fast memory accesses *)
+	
+	CONST
+		BlockHeaderSize = 4;
+		BlockTailSize = 4;
+		FreeBit = 0;
+		EndSizeOffset = -4;
+		BeginSizeOffset = 0;
+		PreviousFreeOffset = 4;
+		NextFreeOffset = 8;
+		Nil = Memory.Nil;
+	
+    TYPE
+    	Address = Memory.Address;
+    	FreeLists = ARRAY NofFreeLists OF Address;
+         		
+	VAR
+		lock: Processors.SpinLock;
+		heap: Memory.Block;
+		heapBegin-, heapEnd-: Address;
+		freeLists: FreeLists;
+		freeSize-: CARDINAL;
+	    	
+	PROCEDURE New*(VAR adr: Address; size: LONGINT);
+	BEGIN
+		INC(size, BlockHeaderSize + BlockTailSize);
+		IF size MOD MinAlignment # 0 THEN INC(size, MinAlignment - size MOD MinAlignment) END; (* round up *)
+		Allocate(adr, UNSIGNED(size));
+		INC(adr, BlockHeaderSize);
+		ASSERT(adr MOD MinAlignment = 0)
+	END New;
+	
+	PROCEDURE Delete*(adr: Address);
+	BEGIN
+		DEC(adr, BlockHeaderSize);
+		Deallocate(adr)
+	END Delete;
+	
+	PROCEDURE Allocate(VAR adr: Address; size: CARDINAL);
+	VAR i: LONGINT; search, s, restSize: CARDINAL; rest, next: Address;
+	BEGIN
+		ASSERT(size >= MinimumBlockSize); ASSERT(size MOD 4 = 0);
+		Processors.AcquireLock(lock);
+		(* find sufficiently large free block *)
+		search := size;
+		i := FreeListIndex(search * 2 - 1);
+		adr := freeLists[i];
+		WHILE (i < NofFreeLists - 1) & (adr = Nil) DO 
+			INC(i); adr := freeLists[i]
+		END;
+		IF i = NofFreeLists - 1 THEN 
+			(* last collective list for huge blocks *)
+			REPEAT
+				IF adr # Nil THEN
+					SYSTEM.GET(adr + BeginSizeOffset, s); s := SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, s) - {FreeBit}));
+					IF search > s THEN 
+						SYSTEM.GET(adr + NextFreeOffset, adr)
+					END
+				END
+			UNTIL (adr = Nil) OR (search <= s)
+		END;
+		ASSERT(adr # Nil, 10); (* out of heap memory *)
+		SYSTEM.GET(adr + BeginSizeOffset, s); s := SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, s) - {FreeBit}));
+		ASSERT(search <= s);
+		RemoveFromFreeList(adr);
+		IF s - size >= MinimumBlockSize THEN
+			(* split off the rest *)
+			rest := adr + size; restSize := s - size; s := size;
+			SYSTEM.PUT32(adr + s + EndSizeOffset, s);
+			SYSTEM.PUT32(rest + BeginSizeOffset, SYSTEM.VAL(CARDINAL, SYSTEM.VAL(SET, restSize) + {FreeBit}));
+			SYSTEM.PUT32(rest + restSize + EndSizeOffset, restSize);
+			AddToFreeList(rest)
+		END;
+		SYSTEM.PUT32(adr + BeginSizeOffset, s); (* clear free bit *)
+		EraseMemory(adr + BlockHeaderSize, s - BlockHeaderSize - BlockTailSize);
+		DEC(freeSize, s);
+		Processors.ReleaseLock(lock)
+	END Allocate;
+	
+	PROCEDURE Deallocate(adr: Address);
+	VAR size, leftSize, rightSize: CARDINAL; left, right: Address;
+	BEGIN
+		ASSERT((adr >= heapBegin) & (adr < heapEnd)); ASSERT(adr MOD 4 = 0);
+		Processors.AcquireLock(lock);
+		SYSTEM.GET(adr + BeginSizeOffset, size); 
+		ASSERT(size >= MinimumBlockSize); ASSERT(~(FreeBit IN SYSTEM.VAL(SET, size)));
+		INC(freeSize, size);
+		
+		(* merge with preceeding free block *)
+		IF adr - MinimumBlockSize >= heapBegin THEN
+			SYSTEM.GET(adr + EndSizeOffset, leftSize); left := adr - leftSize; ASSERT(left >= heapBegin);
+			SYSTEM.GET(left + BeginSizeOffset, leftSize);
+			IF FreeBit IN SYSTEM.VAL(SET, leftSize) THEN
+				RemoveFromFreeList(left);
+				leftSize := SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, leftSize) - {FreeBit}));
+				adr := left; INC(size, leftSize);
+				SYSTEM.PUT32(adr + size + EndSizeOffset, size)
+			END
+		END;
+		
+		(* merge with succeding free block *)
+		IF adr + size + MinimumBlockSize < heapEnd THEN
+			right := adr + size;
+			SYSTEM.GET(right + BeginSizeOffset, rightSize); 
+			IF FreeBit IN SYSTEM.VAL(SET, rightSize) THEN
+				RemoveFromFreeList(right);
+				rightSize := SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, rightSize) - {FreeBit}));
+				INC(size, rightSize);
+				SYSTEM.PUT32(adr + size + EndSizeOffset, size)
+			END
+		END;
+		
+		SYSTEM.PUT32(adr + BeginSizeOffset, SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, size) + {FreeBit})));
+		AddToFreeList(adr);
+		Processors.ReleaseLock(lock)
+	END Deallocate;
+			
+	PROCEDURE AddToFreeList(adr: Address);
+	VAR index: LONGINT; size: CARDINAL;
+	BEGIN
+		SYSTEM.GET(adr + BeginSizeOffset, size); ASSERT(FreeBit IN SYSTEM.VAL(SET, size));
+		size := SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, size) - {FreeBit})); 
+		index := FreeListIndex(size);
+		(* link at the beginning of the (unsorted) list *)
+		SYSTEM.PUT32(adr + PreviousFreeOffset, Nil);
+		SYSTEM.PUT32(adr + NextFreeOffset, freeLists[index]);
+		IF freeLists[index] # Nil THEN
+			SYSTEM.PUT32(freeLists[index] + PreviousFreeOffset, adr)
+		END;
+		freeLists[index] := adr
+	END AddToFreeList;
+	
+	PROCEDURE RemoveFromFreeList(adr: Address);
+	VAR index: LONGINT; size: CARDINAL; prev, next: Address;
+	BEGIN
+		SYSTEM.GET(adr + BeginSizeOffset, size); ASSERT(FreeBit IN SYSTEM.VAL(SET, size));
+		size := SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, size) - {FreeBit})); 
+		SYSTEM.GET(adr + PreviousFreeOffset, prev); ASSERT(SYSTEM.VAL(LONGINT, prev) # 0);
+		SYSTEM.GET(adr + NextFreeOffset, next); ASSERT(SYSTEM.VAL(LONGINT, next) # 0);
+		IF next # Nil THEN
+			SYSTEM.PUT32(next + PreviousFreeOffset, prev)
+		END;
+		IF prev # Nil THEN
+			SYSTEM.PUT32(prev + NextFreeOffset, next)
+		ELSE
+			index := FreeListIndex(size);
+			ASSERT(adr = freeLists[index]);
+			freeLists[index] := next
+		END;
+		SYSTEM.PUT32(adr + PreviousFreeOffset, Nil);
+		SYSTEM.PUT32(adr + NextFreeOffset, Nil)
+	END RemoveFromFreeList;
+					
+	PROCEDURE EraseMemory(start: Address; size: CARDINAL);
+	CODE {SYSTEM.i386}
+		MOV EDI, start[EBP]
+		MOV ECX, size[EBP]
+		XOR EAX, EAX ; overwrite with 0
+		TEST ECX, 3
+		JZ ok
+		PUSH 8	; ASSERT(size MOD 4 = 0)
+		INT 3
+	ok:
+		SHR ECX, 2
+		CLD
+		REP STOSD
+	END EraseMemory;
+	
+	PROCEDURE FreeListIndex(size: CARDINAL): LONGINT;
+	VAR i: LONGINT; s: CARDINAL;
+	BEGIN
+		i := 0; s := MinimumBlockSize * 2;
+		WHILE (i < NofFreeLists - 1) & (size >= s) DO
+			INC(i); s := s * 2
+		END;
+		RETURN i
+	END FreeListIndex;
+									
+	PROCEDURE InitializeFreeLists;
+	VAR i: LONGINT; adr: Address; size: CARDINAL;
+	BEGIN
+		FOR i := 0 TO LEN(freeLists)-1 DO freeLists[i] := Nil END;
+		adr := heapBegin; size := heapEnd - heapBegin;
+		ASSERT(size >= MinimumBlockSize); ASSERT(adr MOD MinAlignment = 0);
+		INC(adr, MinAlignment - BlockHeaderSize); DEC(size, MinAlignment - BlockHeaderSize); (* align addresses *)
+		freeSize := size;
+		SYSTEM.PUT32(adr + BeginSizeOffset, SYSTEM.VAL(CARDINAL, (SYSTEM.VAL(SET, size) + {FreeBit})));
+		SYSTEM.PUT32(adr + size + EndSizeOffset, size);
+		AddToFreeList(adr)		
+	END InitializeFreeLists;
+	
+	PROCEDURE Initialize;
+	BEGIN
+		Processors.AcquireLock(lock);
+		Memory.NewBlock(Memory.LargestFreeBlockSize() - Memory.SystemMemoryReserve, heap);
+		ASSERT(heap.size # 0); (* not enough free memory for heap *)
+		heapBegin := heap.start; heapEnd := heap.start + heap.size;
+		InitializeFreeLists;
+		Processors.ReleaseLock(lock)
+	END Initialize;
+	
+	(** 
+		Reduced Oberon runtime supprt, cf. separate Oberon memory layout specification.
+		All blocks are 4-byte aligned. 
+		Pointer assignments can not yet be used in this module, 
+		as reference counting may be involved for memory safery monitoring
+	*)
+
+	(*
+		Record block:
+									-8  -----------------------
+										  |      reference counter        | (optional)
+		                            -4  -----------------------
+		                                  |    type descriptor tag 00    |-----> record type descriptor
+		record pointer ->  0  -----------------------
+		           					   |             data                       |
+		           					   |                                           |	recSize
+		           					   |                                           |
+		           					   -----------------------
+	*)
+	
+	(* Kernel call 253 *)
+	PROCEDURE SystemNewRecord*(VAR p: PTR; tag: Address);
+	VAR adr: Address; size: LONGINT;
+	BEGIN
+		ASSERT(tag MOD 4 = 0); (* no array or td flag *)
+		SYSTEM.GET(tag, size); 
+		INC(size, 4); (* add space for tag *)
+		IF ReferenceCounting THEN INC(size, 4) (* add space for reference counter *) END;
+		New(adr, size); 
+		IF ReferenceCounting THEN
+			INC(adr, 8);
+			SYSTEM.PUT32(adr-8, 1) (* initial reference counter *)
+		ELSE
+			INC(adr, 4)
+		END;
+		SYSTEM.PUT32(adr-4, tag);
+		SYSTEM.PUT32(SYSTEM.ADR(p), adr)
+	END SystemNewRecord;
+	
+	(*
+		Array block:
+									-8  -----------------------
+										  |      reference counter        | (optional)
+		                            -4  -----------------------
+		                                  |    element type tag 10      |-----> element type descriptor
+		record pointer ->  0  -----------------------
+		           					   |          last element             |-----> address of last array element
+		           				   4  -----------------------
+		           					   |          first element             |-----> address of first array element
+		           				   8  -----------------------
+		           				       |        length[d-1] = n		  |
+		           				       |                   ...                     |
+		           					   |          length[0] = m           |
+		           		4(2+d)    -----------------------
+		           				       |          [ padding ]			   |
+		           				       -----------------------  
+		           				       |       element[0, ..., 0]	 	|  recSize 
+		           				       -----------------------
+		           				       |       element[0, ..., 1]         |
+		           				       -----------------------
+		           				       |                  ...                      |
+		           				       -----------------------
+		           				       |   element[m-1, ... , n-1]   |
+		           				       -----------------------
+	*)
+			
+	(* Kernel call 251 *)
+	PROCEDURE SystemNewArray*(VAR p: PTR; elemTag: Address; numElems, numDims: LONGINT);
+	CONST ArrayBit = 1;
+	VAR adr: Address; elemSize, size: LONGINT; firstElem, lastElem: Address;
+	BEGIN 
+		ASSERT(elemTag MOD 4 = 0); (* no flags *)
+		SYSTEM.GET(elemTag, elemSize);
+		size := 12 + numDims * 4; (* tag, lastelem, firstelem, lengths *)
+		IF ReferenceCounting THEN INC(size, 4) (* ref counter *) END;
+		IF numDims MOD 2 = 1 THEN INC(size, 4) END; 
+			(* round to 8 bytes (excluding tag and optional reference counter *)
+		firstElem := UNSIGNED(size);
+		INC(size, elemSize * numElems);
+		lastElem := UNSIGNED(size - elemSize);
+		New(adr, size);
+		INC(firstElem, adr); INC(lastElem, adr);
+		IF ReferenceCounting THEN
+			INC(adr, 8);
+			SYSTEM.PUT32(adr-8, 1) (* initial reference counter *)
+		ELSE
+			INC(adr, 4)
+		END;
+		ASSERT((firstElem - adr) MOD 8 = 0);
+		SYSTEM.PUT32(adr-4, SYSTEM.VAL(SET, elemTag) + {ArrayBit});
+		SYSTEM.PUT32(adr, lastElem);
+		SYSTEM.PUT32(adr+4, firstElem);
+		SYSTEM.PUT32(SYSTEM.ADR(p), adr)
+	END SystemNewArray;
+	
+	(* Kernel call 243 *)
+	PROCEDURE SystemDeleteBlock*(VAR p: PTR);
+	CONST TdBit = 0; ArrayBit = 1;
+	VAR adr: Address; tag: Address; counter: LONGINT; isArray: BOOLEAN; 
+		size, nofElems, ptrOfs, k: LONGINT; lastElem, firstElem, ptrOfsAdr, ptrAdr, ref: Address;
+	BEGIN
+		ASSERT(SYSTEM.VAL(Address, p) # 0); (* sanity check *)
+		ASSERT(p # NIL, -14); (* NIL check *)
+		adr := SYSTEM.VAL(Address, p); 
+		SYSTEM.GET(adr-4, tag); 
+		ASSERT(~(TdBit IN SYSTEM.VAL(SET, tag))); (* no type descriptor *)
+		
+		IF ReferenceCounting THEN
+			(* adjust counters for contained references *)
+			isArray := ArrayBit IN SYSTEM.VAL(SET, tag);
+			tag := SYSTEM.VAL(Address, SYSTEM.VAL(SET, tag) - {ArrayBit});
+			SYSTEM.GET(tag, size); ASSERT(size >= 0);
+			IF isArray THEN
+				SYSTEM.GET(adr, lastElem); SYSTEM.GET(adr + 4, firstElem);
+				IF (size > 0) & (firstElem <= lastElem) THEN
+					nofElems := 1 + (SIGNED(lastElem - firstElem) DIV size)
+				ELSE nofElems := 0
+				END
+			END;
+			ptrOfsAdr := tag + 4;
+			SYSTEM.GET(ptrOfsAdr, ptrOfs);
+			WHILE ptrOfs >= 0 DO
+				ASSERT(ptrOfs < size);
+				IF isArray THEN
+					FOR k := 0 TO nofElems-1 DO
+						ptrAdr := firstElem + k * size + ptrOfs;
+						SYSTEM.GET(ptrAdr, ref);
+						DecRefCounter(ref)
+					END
+				ELSE
+					ptrAdr := adr + ptrOfs;
+					SYSTEM.GET(ptrAdr, ref);
+					DecRefCounter(ref)
+				END;
+				INC(ptrOfsAdr, 4);
+				SYSTEM.GET(ptrOfsAdr, ptrOfs)
+			END;
+			(* check reference counter *)			
+			SYSTEM.GET(adr-8, counter);
+			ASSERT(counter = 1, -13); (* dangling pointer check *)
+		END;
+		
+		IF ReferenceCounting THEN
+			DEC(adr, 8)
+		ELSE
+			DEC(adr, 4)
+		END; 
+		Delete(adr);
+		SYSTEM.PUT32(SYSTEM.ADR(p), Nil)
+	END SystemDeleteBlock;
+	
+	PROCEDURE DecRefCounter(adr: Address);
+	CONST RefCntOfs = -8;
+	VAR refCnt: LONGINT;
+	BEGIN
+		IF adr # Nil THEN
+			AtomicDec(adr + RefCntOfs);
+			SYSTEM.GET(adr + RefCntOfs, refCnt);
+			ASSERT(refCnt >= 1, -12); (* memory leak *)
+		END
+	END DecRefCounter;
+	
+	PROCEDURE -AtomicDec(adr: Address);
+	CODE {SYSTEM.i386}
+		POP EAX
+		LOCK ; atomic
+		DEC DWORD [EAX]
+	END AtomicDec;
+	
+BEGIN
+	Processors.InitializeLock(lock);
+	Initialize
+END Heap.
+

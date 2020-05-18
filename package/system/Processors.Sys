@@ -1,0 +1,345 @@
+MODULE Processors {UNCHECKED}; (** Kernel, Processor Resources, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM; (* no stack overflow checks *)
+	
+	(** 
+		IA32 multi-processor support 
+		Processor initialization based on Pieter Muller's Aos implementation
+	*)
+	
+	CONST
+		MaxProcessors* = 8;
+	
+	TYPE
+		Address = CARDINAL;
+	
+	(** 
+		Fine-grained spin-locks for processor synchronization, 
+		  - one lock per module, 
+		  - strict linear (module-associated) lock order avoids deadlocks 
+		  - interrupts are disabled within critical section 
+		  	(to enable deadlocks by possible inherent upcalls of interrupt handlers)
+	*)
+	TYPE
+		SpinLock* = RECORD
+			locked-: LONGINT;
+			interruptsEnabled-: BOOLEAN
+		END;
+	
+	CONST
+		(** values for SpinLock.locked *)
+		Locked* = 1;
+		Unlocked* = 0;
+	
+	TYPE	
+		(** Processor specific features *) 
+		Vendor = ARRAY 13 OF CHAR;
+		
+	CONST
+		(** processor features *)
+		APICFeature* = 9; (* APIC on-chip, bit flag in features *)
+		HyperThreading* = 28; (* Hyper threading support, bit flag in features *)
+
+		APICAddress* = 0FEE00000H;
+		APICIDAddress* = APICAddress + 20H;
+
+	(** Multi-processor specific *)
+	TYPE
+		StartProcessor* = PROCEDURE; (** must not be a method *)
+
+	VAR		
+		nofProcessors-: LONGINT;
+		running-: ARRAY MaxProcessors OF BOOLEAN;
+		features-: SET; (** Processor features, see IA32, vol 2, CPUID, table 3-11 *)
+		idAddress: CARDINAL;
+		bootID-: LONGINT;
+		displayAddress-: CARDINAL;
+				
+	PROCEDURE InitializeLock*(VAR lock: SpinLock);
+	BEGIN lock.locked := Unlocked
+	END InitializeLock;
+	
+	(** 
+		Acquire a spin lock
+	      - process must not be preempted and re-scheduled to a new processor (deadlock danger)
+	      - disables interrupt during critical section (to prevent deadlocks with interrupts)
+	*)
+	PROCEDURE AcquireLock*(VAR lock: SpinLock);
+	VAR enabled: BOOLEAN;
+	BEGIN
+		enabled := InterruptsEnabled();
+		SYSTEM.CLI;
+		AcquireSpinLockByAdr(SYSTEM.ADR(lock.locked));
+		lock.interruptsEnabled := enabled
+	END AcquireLock;
+	
+	(** 
+		Release a spin lock
+		- process must not be preempted and re-scheduled to a new processor (deadlock danger)
+		- restores interrupt state like before the critical section
+	*)
+	PROCEDURE ReleaseLock*(VAR lock: SpinLock);
+	VAR enabled: BOOLEAN;
+	BEGIN
+		enabled := lock.interruptsEnabled;
+		ReleaseSpinLockByAdr(SYSTEM.ADR(lock.locked));
+		IF enabled THEN SYSTEM.STI END
+	END ReleaseLock;
+	
+	(** Locked by any processor *)
+	PROCEDURE IsLocked*(VAR lock: SpinLock): BOOLEAN;
+	BEGIN RETURN lock.locked = Locked
+	END IsLocked;
+		
+	PROCEDURE -AcquireSpinLockByAdr*(lockAdr: Address);
+	CODE {SYSTEM.i386}
+		POP EBX 					; lockAdr
+		
+		MOV EAX, Locked
+	spin:
+		XCHG [EBX], EAX		; atomic set and read; implicit LOCK prefix, implicit memory fence for cache coherence
+		CMP EAX, Locked
+		JNE exit
+		
+		XOR ECX, ECX 		   ; just in case that some processor interprets this as REP
+		REP NOP					 ; PAUSE instruction for spin loop hint
+		
+		JMP spin
+	exit: 
+	END AcquireSpinLockByAdr;
+	
+	PROCEDURE -ReleaseSpinLockByAdr*(lockAdr: Address);
+	CODE {SYSTEM.i386}
+		POP EBX
+		MOV EAX, Unlocked
+		MOV [EBX], EAX
+	END ReleaseSpinLockByAdr;
+	
+	PROCEDURE IsSpinLockedByAdr*(lockAdr: Address): BOOLEAN;
+	BEGIN RETURN SYSTEM.GET32(lockAdr) = Locked
+	END IsSpinLockedByAdr;
+		
+	(** Hint to processor to improve performance of spin loops *)
+	PROCEDURE -SpinHint*;
+	CODE {SYSTEM.i386}
+		XOR ECX, ECX	; just in case that some processor interprets this as REP
+		REP NOP			; PAUSE instruction for spin loop hint
+	END SpinHint;
+	
+	(** Unique processor ID *)
+	PROCEDURE ID*(): LONGINT;
+	CODE {SYSTEM.i386}
+		(* APIC ID, see IA32, vol3, 8.4.6 *)
+		MOV EAX, idAddress
+		MOV EAX, [EAX]
+		SHR EAX, 24 ; shift reserved section
+		AND EAX, 15; only 8 bit used for ID
+	END ID;
+
+	PROCEDURE -Halt*;
+	CODE {SYSTEM.i386, SYSTEM.Privileged}
+		STI   (* required according to ACPI 2.0 spec section 8.2.2 *)
+		HLT
+	END Halt;
+	
+	PROCEDURE InterruptsEnabled*(): BOOLEAN;
+	CONST IFBit = 9; (* interrupt flag in EFLAGS, see IA32, vol 3, section 2.3 *)
+	BEGIN RETURN IFBit IN EFLAGS()
+	END InterruptsEnabled;
+	
+	PROCEDURE -EFLAGS(): SET;
+	CODE {SYSTEM.i386}
+		PUSHFD
+		POP EAX
+	END EFLAGS;
+						
+	PROCEDURE Reboot*;
+	BEGIN
+		SYSTEM.CLI;
+		SYSTEM.PORTOUT(070H, 08FX); (* Reset type: 5-37 AT Standard Ref. *)
+		SpinHint; SYSTEM.PORTOUT(071H, 000X);	(* soft boot flag was set on initialization *)
+		SpinHint; SYSTEM.PORTOUT(070H, 0DX);
+		SpinHint; SYSTEM.PORTOUT(064H, 0FEX); (* reset CPU *)
+		LOOP END
+	END Reboot;
+	
+	PROCEDURE -MicroTime*(): CARDINAL;
+	CODE {SYSTEM.Pentium}
+		RDTSC (* sets EDX:EAX *)
+		SHL EDX, 22
+		SHR EAX, 10
+		OR EAX, EDX
+	END MicroTime;
+							
+	(* initialization *)
+	
+	(* ESI is occupied for stack overflow boundary *)
+	PROCEDURE CPUID(VAR vendor: Vendor; VAR version: LONGINT; VAR features: SET);
+	CODE {SYSTEM.i386, SYSTEM.Pentium}
+		MOV EAX, 0
+		CPUID
+		CMP EAX, 0
+		JNE ok
+		MOV EDI, vendor[EBP]
+		MOV [EDI], AL	; AL = 0
+		MOV EDI, version[EBP]
+		MOV [EDI], EAX	; EAX = 0
+		MOV EDI, features[EBP]
+		MOV [EDI], EAX
+		JMP end
+	ok:
+		MOV EDI, vendor[EBP]
+		MOV [EDI], EBX
+		MOV 4[EDI], EDX
+		MOV 8[EDI], ECX
+		MOV BYTE 12[EDI], 0
+		MOV EAX, 1
+		CPUID
+		MOV EDI, version[EBP]
+		MOV [EDI], EAX
+		MOV EDI, features[EBP]
+		MOV [EDI], EDX
+	end:
+	END CPUID;
+	
+	(* Set up EFLAGS (IA32 volume 3, pages 12-14)
+		Bit
+		1,3,5,15,19..31 - no change
+		0,2,4,6..7,11 - CF,PF,AF,ZF,SF,OF off
+		8 - TF off
+		9 - IF off (no interrupts)
+		10 - DF off
+		12..13 - IOPL = 3
+		14 - NT off (no Windows)
+		16 - RF off (no Interference)
+		17 - VM off (no virtual 8086 mode)
+		18 - AC off (no 486 alignment checks) *)
+	PROCEDURE -SetupEFlags;
+	CODE {SYSTEM.i386}
+		PUSHFD	; PUSH EFLAGS
+		AND DWORD [ESP], 0FFF8802AH
+		OR DWORD [ESP], 3000H
+		POPFD	; POP EFLAGS
+	END SetupEFlags;
+	
+	(* Set up various CR0 flags (volume 3, pages 18-20)
+		0, 4, 6..17, 21..31 - no change
+		1 - MP off (monitor coprocessor) 
+		2 - EM off (math emulation)
+		3 - TS off (task switched for FPU/MMX/SSE..)
+		5 - NE on (numeric errors)
+		18 - AM on (alignment mask) *)
+	PROCEDURE -SetupCR0Flags;
+	CODE {SYSTEM.i386, SYSTEM.Privileged}
+		MOV EAX, CR0
+		AND EAX, 0FFFFFFF1H
+		OR EAX, 00040020H
+		MOV CR0, EAX
+	END SetupCR0Flags;
+	
+	PROCEDURE -InitFPU;
+	CODE {SYSTEM.i386, SYSTEM.FPU}
+		FNINIT
+	END InitFPU;
+	
+	(** Called by every processor, should be mututally excluded *)
+	PROCEDURE InitializeProcessor*;
+	BEGIN
+		INC(nofProcessors);
+		SYSTEM.PUTREG(SYSTEM.ESI, 0); (* ESI used for stack overflow checks *)
+		InitFPU;
+		SetupEFlags;
+		SetupCR0Flags;
+		running[ID()] := TRUE
+	END InitializeProcessor;
+	
+	(** Boot code for additional processors in a multi-processor system, 
+		pageAdr must denote the phyisical address of the boot page in real-mode (1MB low memory)
+		gdtBaseAdr = SYSTEM.ADR(gdt[0]) *)
+	PROCEDURE InitializeMPBootPage*(VAR pageAdr: CARDINAL; start: StartProcessor; 
+		gdtBaseAdr: CARDINAL; kernelStackSegSel: LONGINT);
+	CONST 
+		KB = 1024; PS = 4*KB; BootOfs = 800H; MB = 1024*KB; 
+		MPBootPageAddress = 504*KB; (* 504KB-512KB reserved by linker *)
+	VAR adr, a: CARDINAL;
+	BEGIN
+		pageAdr := MPBootPageAddress;
+		ASSERT((pageAdr >= 0) & (pageAdr < MB) & (pageAdr MOD PS = 0));
+		ASSERT(kernelStackSegSel = 2*8); (* assumed in boot code below *)
+		adr := pageAdr + BootOfs;
+		a := adr;
+		
+		(* boot code in real mode, based on Pieter Muller SMP.Asm 
+			; real mode, use of non-privileged 386 instructions
+		EB 12							JMP L1
+		
+		CS:0802H:	startptr dw ?, ? 			   ; start procedure address (4 bytes)
+		align 8
+		CS:0808H:	idtptr  dp 0					  ; 48-bit null pointer for interrupt descriptor table 
+																	; (2 byte limit with 0, 4 bytes initialized with 0)
+		CS:080EH:	gdtptr dw 3*8-1, ?, ?      ; 48-bit pointer to global descriptor table 
+																	; (2 byte limit 3*8-1, followed by 4-byte GDT address)
+																	
+		L1:
+		; initialize descriptor tables
+		FA								  CLI
+		2E | 0F 01 1E 08 08	   LIDT [idptr]   (CS:0808H) ; load interrupt descriptor table with all zeros 
+		2E | 0F 01 16 0E 08	   LGDT[gdtptr] (CS:080EH) ; load global (memory) descriptor table
+		
+		; enable protection
+		0F 01 E0				         SMSW AX			 ; read bits 0-15 of CR0 to AX
+		0C 01				   		   OR AL, 1				; set protection enable bit
+		0F 01 F0			   		   LMSW EAX			; store AX to bits 0- 15 of CR0
+		EB 00				  			JMP L2					; flush instruction (prefetch) queue
+		L2:
+		
+		; load segment selectors
+		B8 10 00 		   			MOV AX, 2*8		 ; kernel stack/data segment selector
+		8E D0				 			MOV SS, AX
+		8E D8				 			MOV DS, AX
+		8E C0				 			 MOV ES, AX
+
+		; initialize stack and execute start procedure
+		66 | BC 00 00 08 00 	  MOV ESP, 512*KB ; 4-KB temporary stack, grows towards lower addresses
+		66 | 33 C0					  XOR EAX, EAX
+		66 | 2E | FF 2E 02 08     JMPFAR [startptr] (CS:0802H)   ; jump to start procedure in 32-bit kernel
+		
+		90								   NOP		
+		*)
+		(* little Endian encoding *)
+		SYSTEM.PUT32(a, 0000012EBH);  INC(a, 4);  SYSTEM.PUT32(a, 000080000H);  INC(a, 4);
+		SYSTEM.PUT32(a, 000000000H);  INC(a, 4);  SYSTEM.PUT32(a, 000170000H);  INC(a, 4);
+		SYSTEM.PUT32(a, 000000000H);  INC(a, 4);  SYSTEM.PUT32(a, 0010F2EFAH);  INC(a, 4);
+		SYSTEM.PUT32(a, 02E08081EH);  INC(a, 4);  SYSTEM.PUT32(a, 00E16010FH);  INC(a, 4);
+		SYSTEM.PUT32(a, 0E0010F08H);  INC(a, 4);  SYSTEM.PUT32(a, 0010F010CH);  INC(a, 4);
+		SYSTEM.PUT32(a, 0B800EBF0H);  INC(a, 4);  SYSTEM.PUT32(a, 0D08E0010H);  INC(a, 4);
+		SYSTEM.PUT32(a, 0C08ED88EH);  INC(a, 4);  SYSTEM.PUT32(a, 00000BC66H);  INC(a, 4);
+		SYSTEM.PUT32(a, 033660008H);  INC(a, 4);  SYSTEM.PUT32(a, 0FF2E66C0H);  INC(a, 4);
+		SYSTEM.PUT32(a, 09008022EH);  INC(a, 4);
+			(* fixup in boot code*)
+		SYSTEM.PUT32(adr+2, SYSTEM.VAL(LONGINT, start));	(* not a method *)
+		SYSTEM.PUT32(adr+16, gdtBaseAdr);
+			(* branch at page start *)
+		SYSTEM.PUT8(pageAdr, 0EAX);	(* JMPFAR *)
+		SYSTEM.PUT32(pageAdr + 1, SYSTEM.LSH(pageAdr, 16-4) + BootOfs)	(* seg:ofs *)
+	END InitializeMPBootPage;
+	
+	PROCEDURE InitializeSystem;
+	VAR vendor: Vendor; version, i: LONGINT; 
+	BEGIN
+		nofProcessors := 0;
+		SYSTEM.PUT(0472H, 01234H); (* soft boot flag *)
+		CPUID(vendor, version, features);
+		FOR i := 0 TO MaxProcessors-1 DO running[i] := FALSE END;
+		InitializeProcessor;
+		IF APICFeature IN features THEN
+			idAddress := APICIDAddress; bootID := ID()
+		ELSE
+			bootID := 0; idAddress := SYSTEM.ADR(bootID)
+		END
+	END InitializeSystem;
+	
+BEGIN
+	SYSTEM.GETREG(7, displayAddress);
+	InitializeSystem
+END Processors.
+

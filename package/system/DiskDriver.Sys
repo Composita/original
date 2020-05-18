@@ -1,0 +1,985 @@
+MODULE ComDiskDriver; (* Component System, ATA Disks Driver, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Concurrency, Interrupts, Output, Memory, Processors;
+	
+    (* ATA Disks driver partly based on AOS and Oberon implementation *)
+
+	CONST
+		Trace = FALSE;
+	
+		NofControllers = 2; (* primary, secondary *)
+		NofDevices = 2*NofControllers; (* master, slave *)
+
+		ResetTimeout = 1000; (* ms *)
+		IdentifyTimeout = 100; (* ms *)
+		SelectTimeout = 5000; (* ms *)
+		IOTimeout = 10000; (* ms *)
+		
+		MaxTransfer = 256; (* <= 256 (128KB) *)
+		BS = 512;
+		MinLBA = 8000000;
+		
+		(* type bits *)
+		AtapiBit = 0; RemovableBit* = 1; DMABit = 2; LBABit = 3; RMSNBit = 4; Packet16Bit = 5;
+		
+		(* status word bits *)
+		ERR = 0;  DRQ = 3;  DRDY = 6;  BSY = 7;
+		
+		(** message types *)
+		EjectMessage* = 0; LockMessage* = 1; UnlockMessage* = 2;
+				
+		(** partition flags *)
+		Mounted* = 0; Primary* = 1; Boot* = 2; Valid* = 3; 
+		
+	TYPE
+		Address = Memory.Address;
+		
+		Message* = LONGINT;
+	
+		CHS* = RECORD
+			cyls-, hds-, spt-: LONGINT
+		END;
+		
+		ID* = RECORD
+			type-: SET;
+			ver-, devtype-: LONGINT;
+			model-: ARRAY 44 OF CHAR
+		END;
+	
+		Controller = RECORD
+			ctrlId: LONGINT;
+			enabled: BOOLEAN;
+			port1, port2, irq: LONGINT;
+			interrupt: BOOLEAN
+		END;
+		
+		Device* = RECORD
+			enabled-: BOOLEAN;
+			devId-: LONGINT;
+			ctrlId-: LONGINT;
+			devNum-: LONGINT; (* 0 or 1 *)
+			totalSize-: LONGINT; 
+			blockSize-: LONGINT;
+			chs-: CHS;
+			geometry-: CHS;
+			id-: ID;
+			initialized-: BOOLEAN;
+			openCount-: LONGINT;
+			table-: PartitionTable;
+		END;
+		
+		Partition* = RECORD
+			type-: LONGINT; (** partition type *)
+			start-, size-: LONGINT; (** start block and size of partition in blocks *)
+			flags-: SET; (** Mounted, Primary, Boot, Valid *)
+			ptblock-: LONGINT; (** block containing partition table entry *)
+			ptoffset-: LONGINT (** offset in partition table of entry, 0 if unknown *)
+		END;
+		
+		PartitionTable* = POINTER TO ARRAY OF Partition;
+		
+		Packet = ARRAY 16 OF CHAR;
+		
+		DiskBlock = ARRAY BS OF CHAR;
+						
+	VAR
+		initialized: BOOLEAN;
+		controllers: ARRAY NofControllers OF Controller;
+		devices-: ARRAY NofDevices OF Device;
+		lock: Concurrency.WaitLock;
+	
+	PROCEDURE Transfer*(VAR device: Device; read: BOOLEAN; lba, num: LONGINT; 
+		VAR data: ARRAY OF CHAR; ofs: LONGINT; VAR ok: BOOLEAN);
+	BEGIN 
+		Lock;
+		InternalTransfer(device, controllers[device.ctrlId], read, lba, num, data, ofs, ok);
+		Unlock
+	END Transfer;
+	
+	PROCEDURE GetSize*(VAR device: Device; VAR size: LONGINT; VAR ok: BOOLEAN);
+	BEGIN
+		Lock;
+		InternalGetSize(device, controllers[device.ctrlId], size, ok);
+		Unlock
+	END GetSize;
+	
+	(** ~ok if error, done if command was known by the device *)
+	PROCEDURE Handle*(VAR device: Device; msg: Message; VAR done, ok: BOOLEAN);
+	BEGIN
+		Lock;
+		InternalHandle(device, controllers[device.ctrlId], msg, done, ok);
+		Unlock
+	END Handle;
+	
+	PROCEDURE Open*(VAR device: Device; VAR ok: BOOLEAN);
+	BEGIN
+		Lock;
+		InternalOpen(device, controllers[device.ctrlId], ok);
+		Unlock
+	END Open;
+	
+	PROCEDURE Close*(VAR device: Device; VAR ok: BOOLEAN);
+	BEGIN
+		Lock;
+		InternalClose(device, controllers[device.ctrlId], ok);
+		Unlock
+	END Close;
+	
+	PROCEDURE InternalOpen(VAR device: Device; VAR controller: Controller; VAR ok: BOOLEAN);
+	VAR done, ignore: BOOLEAN;
+	BEGIN
+		ASSERT(device.enabled);
+		ASSERT(device.ctrlId = controller.ctrlId);
+		ok := TRUE;
+		IF device.openCount = 0 THEN
+			IF RemovableBit IN device.id.type THEN
+				InternalHandle(device, controller, LockMessage, done, ok)
+			END;
+			IF ok THEN
+				ReadPartitionTable(device, ok);
+				IF ~ok & (RemovableBit IN device.id.type) THEN 
+					InternalHandle(device, controller, UnlockMessage, done, ignore)
+				END
+			END
+		END;
+		IF ok THEN INC(device.openCount) END
+	END InternalOpen;
+	
+	PROCEDURE InternalClose(VAR device: Device; VAR controller: Controller; VAR ok: BOOLEAN);
+	VAR done: BOOLEAN;
+	BEGIN
+		ASSERT(device.enabled);
+		ASSERT(device.ctrlId = controller.ctrlId);
+		ok := TRUE;
+		ASSERT(device.openCount > 0);
+		DEC(device.openCount);
+		IF device.openCount = 0 THEN
+			IF RemovableBit IN device.id.type THEN
+				InternalHandle(device, controller, UnlockMessage, done, ok)
+			END;
+			IF device.table # NIL THEN DELETE(device.table) END
+		END
+	END InternalClose;
+	
+	(* Read a PC-format partition table starting at block 0 and initialize device.table. device.table[0] is a virtual 
+		partition spanning the entire device, with type = 256. If the device has been opened before *)
+	PROCEDURE ReadPartitionTable(VAR device: Device; VAR ok: BOOLEAN);
+	VAR p, t: PartitionTable; i, pn, tn, size: LONGINT; buf: DiskBlock; valid: BOOLEAN;
+	BEGIN
+		IF device.openCount = 0 THEN
+			tn := 0; ok := TRUE;
+			IF device.table # NIL THEN DELETE(device.table) END;
+			InternalGetSize(device, controllers[device.ctrlId], size, ok);
+			IF ok & (size = 0) THEN ok := FALSE (* media missing *) END;
+			IF ok & (device.blockSize = BS) THEN
+				NEW(p, 4); NEW(t, 8);
+				ReadPrimary(buf, device, p, pn, ok, valid);
+				i := 0;
+				WHILE valid & (i # pn) & ok DO
+					Resize(t, tn+1);  t[tn] := p[i]; INC(tn);
+					IF Extended(p[i].type) THEN
+						ReadLogical(buf, device, p[i].start, t, tn, ok)
+					END;
+					INC(i)
+				END
+			END;
+			IF ok THEN
+				NEW(device.table, tn + 1);
+				device.table[0].type := 256;
+				IF valid THEN device.table[0].flags := {Valid} ELSE device.table[0].flags := {} END;
+				device.table[0].start := 0; device.table[0].size := size;
+				FOR i := 1 TO tn DO device.table[i] := t[i-1] END
+			END;
+			IF p # NIL THEN DELETE(p) END;
+			IF t # NIL THEN DELETE(t) END
+		ELSE ok := FALSE (* partition is already open *)
+		END
+	END ReadPartitionTable;
+	
+	PROCEDURE ReadPrimary(VAR b: DiskBlock; VAR device: Device; VAR p: PartitionTable; VAR n: LONGINT; 
+		VAR ok, valid: BOOLEAN);
+	VAR e, size, i: LONGINT;
+	BEGIN
+		n := 0;
+		InternalTransfer(device, controllers[device.ctrlId], TRUE, 0, 1, b, 0, ok);
+		IF ok & (b[510] = 055X) & (b[511] = 0AAX) THEN (* signature ok *)
+			valid := ValidFlag(b[01BEH]) & ValidFlag(b[01BEH+16]) & ValidFlag(b[01BEH+32]) & ValidFlag(b[01BEH+48]);
+			IF valid THEN
+				FOR i := 0 TO 3 DO
+					e := 01BEH + 16 * i; size := Get4(b, e+12);
+					IF (b[e+4] # 0X) & (size # 0) THEN (* non-empty partition *)
+						Resize(p, n+1);  p[n].type := ORD(b[e+4]);
+						p[n].start := Get4(b, e+8); p[n].size := size; p[n].flags := {Valid, Primary};
+						IF b[e] # 0X THEN INCL(p[n].flags, Boot) END;
+						p[n].ptblock := 0; p[n].ptoffset := e;
+						INC(n)
+					END
+				END
+			END
+		END
+	END ReadPrimary;
+	
+	PROCEDURE ReadLogical(VAR b: DiskBlock; VAR device: Device; first: LONGINT; VAR p: PartitionTable; VAR n: LONGINT;
+		VAR ok: BOOLEAN);
+	VAR e, sec, size, i: LONGINT; found: BOOLEAN;
+	BEGIN
+		sec := first;
+		REPEAT
+			found := FALSE;
+			InternalTransfer(device, controllers[device.ctrlId], TRUE, sec, 1, b, 0, ok);
+			IF ok & (b[510] = 055X) & (b[511] = 0AAX) THEN
+				FOR i := 0 TO 3 DO (* look for partition entry (max one expected) *)
+					e := 01BEH + 16 * i;  size := Get4(b, e+12);
+					IF (b[e+4] # 0X) & ~Extended(ORD(b[e+4])) & (size # 0) THEN
+						Resize(p, n+1);  p[n].type := ORD(b[e+4]);
+						p[n].start := sec + Get4(b, e+8);  p[n].size := size; p[n].flags := {Valid};
+						IF b[e] # 0X THEN INCL(p[n].flags, Boot) END;
+						p[n].ptblock := sec; p[n].ptoffset := e;
+						INC(n)
+					END
+				END;
+				i := 0;
+				WHILE (i # 4) & ~found DO (* look for nested extended entry (max one expected) *)
+					e := 01BEH + 16*i; size := Get4(b, e+12);
+					IF Extended(ORD(b[e+4])) & (size # 0) THEN (* found *)
+						sec := first + Get4(b, e+8);
+						i := 4; found := TRUE
+					ELSE INC(i)
+					END
+				END
+			END
+		UNTIL ~found
+	END ReadLogical;
+	
+	PROCEDURE Resize(VAR p: PartitionTable; n: LONGINT);
+	VAR old: PartitionTable; i, len: LONGINT;
+	BEGIN
+		len := LEN(p); WHILE len < n DO len := 2*len END;
+		old := p; NEW(p, len);
+		FOR i := 0 TO LEN(old)-1 DO p[i] := old[i] END;
+		DELETE(old)
+	END Resize;
+	
+	PROCEDURE Get4(VAR b: ARRAY OF CHAR; i: LONGINT): LONGINT;
+	BEGIN RETURN ORD(b[i]) + ASH(ORD(b[i+1]), 8) + ASH(ORD(b[i+2]), 16) + ASH(ORD(b[i+3]), 24)
+	END Get4;
+	
+	PROCEDURE Extended(type: LONGINT): BOOLEAN;
+	BEGIN RETURN (type = 5) OR (type = 15)
+	END Extended;
+	
+	PROCEDURE ValidFlag(f: CHAR): BOOLEAN;
+	BEGIN RETURN (f = 0X) OR (f = 80X) OR (f = 81X)
+	END ValidFlag;
+		
+	PROCEDURE PrintPartitionTable*(table: PartitionTable);
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO LEN(table)-1 DO
+			Output.Integer(i); Output.Text(" "); Output.Integer(table[i].type); Output.Text(" ");
+			Output.Integer(table[i].start); Output.Text(" "); Output.Integer(table[i].size); Output.Text(" ");
+			IF Mounted IN table[i].flags THEN Output.Text(" M ")
+			ELSIF Primary IN table[i].flags THEN Output.Text(" P ")
+			ELSIF Boot IN table[i].flags THEN Output.Text(" B ")
+			ELSIF Valid IN table[i].flags THEN Output.Text(" V ")
+			END;
+			Output.Integer(table[i].ptblock); Output.Text(" ");
+			Output.Integer(table[i].ptoffset); Output.Line
+		END
+	END PrintPartitionTable;
+		
+	PROCEDURE InternalHandle(VAR device: Device; VAR controller: Controller; msg: Message; VAR done, ok: BOOLEAN);
+	BEGIN 
+		ASSERT(device.enabled);
+		ASSERT(device.ctrlId = controller.ctrlId);
+		SelectDevice(controller.port1, device.devNum, SelectTimeout, ok);
+		IF ok THEN
+			ok := TRUE; done := FALSE;
+			IF msg = LockMessage THEN
+				IF RemovableBit IN device.id.type THEN
+					IF RMSNBit IN device.id.type THEN
+						RMSNEnable(controller.port1, ok);
+						IF ok & (AtapiBit IN device.id.type) THEN (* flush messages *)
+							ATAPIFlushSenses(controller.port1, controller.port2)
+						END;
+						IF ok THEN done := TRUE END
+					ELSIF ~(AtapiBit IN device.id.type) THEN
+						ExecuteATACommand(controller.port1, controller.port2, 0DEX, ok); (* media lock *)
+						IF ok THEN done := TRUE END
+					END
+				END
+			ELSIF msg = UnlockMessage THEN
+				IF RemovableBit IN device.id.type THEN
+					IF RMSNBit IN device.id.type THEN
+						RMSNDisable(controller.port1, ok);
+						IF ok THEN done := TRUE END
+					ELSIF ~(AtapiBit IN device.id.type) THEN
+						ExecuteATACommand(controller.port1, controller.port2, 0DFX, ok); (* media unlock *)
+						IF ok THEN done := TRUE END
+					END
+				END
+			ELSIF msg = EjectMessage THEN
+				IF RemovableBit IN device.id.type THEN
+					EjectMedia(controller.port1, controller.port2, AtapiBit IN device.id.type, ok);
+					IF ok THEN done := TRUE END
+				END
+			END
+		END
+	END InternalHandle;
+	
+	PROCEDURE InternalGetSize(VAR device: Device; VAR controller: Controller; VAR size: LONGINT; VAR ok: BOOLEAN);
+	BEGIN
+		IF (RemovableBit IN device.id.type) & (AtapiBit IN device.id.type) THEN
+			GetATAPISize(controller, device, device.blockSize, device.totalSize, ok)
+		ELSE ok := TRUE
+		END;
+		size := device.totalSize
+	END InternalGetSize;
+	
+	PROCEDURE InternalTransfer(VAR device: Device; VAR controller: Controller; read: BOOLEAN; lba, num: LONGINT; 
+		VAR data: ARRAY OF CHAR; ofs: LONGINT; VAR ok: BOOLEAN);
+	CONST MaxTries = 5;
+	VAR bufAdr: Address; num1, try, sense, physAdr: LONGINT; packet: Packet;
+	BEGIN
+		ASSERT(device.enabled);
+		ASSERT(device.ctrlId = controller.ctrlId);
+		bufAdr := SYSTEM.ADR(data[ofs]);
+		IF (lba >= 0) & (num >= 0) & (lba < device.totalSize) & (lba + num <= device.totalSize) THEN
+			ASSERT(num * device.blockSize <= LEN(data) - ofs); (* range check *)
+			SelectDevice(controller.port1, device.devNum, SelectTimeout, ok);
+			IF ok & ~device.initialized THEN	(* initialize *)
+				InitDevice(controller.port1, controller.port2, device.devNum, device.id.type, device.chs, ok);
+				device.initialized := ok
+			END;
+			WHILE ok & (num > 0) DO
+				try := MaxTries; num1 := MaxTransfer;
+				IF num1 > num THEN num1 := num END;
+				REPEAT
+					IF AtapiBit IN device.id.type THEN
+						IF read THEN ATAPIComposePacket(packet, 28X, lba, num)
+						ELSE ATAPIComposePacket(packet, 2AX, lba, num)
+						END;
+						ATAPISubmit(controller.port1, controller.port2, packet, read, bufAdr, num * device.blockSize, sense, ok)
+					ELSE
+						IF read THEN ReadPIO(device, controller, lba, num1, bufAdr, ok)
+						ELSE WritePIO(device, controller, lba, num1, bufAdr, ok)
+						END
+					END;
+					DEC(try)
+				UNTIL ok OR (try = 0);
+				INC(lba, num1); DEC(num, num1); INC(bufAdr, UNSIGNED(BS * num1))
+			END
+		ELSE ok := FALSE (* transfer out of range *)
+		END
+	END InternalTransfer;
+	
+	PROCEDURE ReadPIO(VAR device: Device; VAR controller: Controller; 
+		lba, num: LONGINT; bufAdr: Address; VAR ok: BOOLEAN);
+	VAR x: CHAR; s: SET;
+	BEGIN
+		ok := TRUE;
+		ResetControllerInterrupt(controller);
+		Command(device, 20X, lba, num); (* read sectors *)
+		REPEAT
+			AwaitControllerInterrupt(controller, IOTimeout, ok);
+			IF ok THEN
+				WaitNotBusy(controller.port2);
+				SYSTEM.PORTIN(controller.port1 + 7, x); s := SYSTEM.VAL(SET, LONG(ORD(x)));
+				IF ~(ERR IN s) THEN
+					RepInWord(controller.port1, bufAdr, BS DIV 2);
+					INC(bufAdr, UNSIGNED(BS)); DEC(num)
+				ELSE ok := FALSE
+				END
+			END
+		UNTIL (num = 0) OR ~ok;
+		SYSTEM.PORTIN(controller.port2, x);
+		SYSTEM.PORTIN(controller.port1 + 7, x); s := SYSTEM.VAL(SET, LONG(ORD(x)));
+		IF ok & (ERR IN s) THEN ok := FALSE END
+	END ReadPIO;
+	
+	PROCEDURE WritePIO(VAR device: Device; VAR controller: Controller; 
+		lba, num: LONGINT; bufAdr: Address; VAR ok: BOOLEAN);
+	VAR x: CHAR; s: SET;
+	BEGIN
+		ok := TRUE;
+		ResetControllerInterrupt(controller);
+		Command(device, 30X, lba, num); (* write sectors *)
+		WaitAltStatus(controller.port1, controller.port2, {DRQ,BSY}, {DRQ}, {ERR}, IOTimeout, ok);
+		IF ok THEN
+			REPEAT
+				RepOutWord(controller.port1, bufAdr, BS DIV 2);
+				INC(bufAdr, UNSIGNED(BS)); DEC(num);
+				AwaitControllerInterrupt(controller, IOTimeout, ok);
+				IF ok THEN
+					WaitNotBusy(controller.port2);
+					SYSTEM.PORTIN(controller.port1 + 7, x); s := SYSTEM.VAL(SET, LONG(ORD(x)));
+					IF ERR IN s THEN ok := FALSE END
+				END
+			UNTIL (num = 0) OR ~ok
+		END;
+		IF ~ok THEN
+			SYSTEM.PORTIN(controller.port1 + 7, x) (* clear interrupt *)
+		END
+	END WritePIO;
+		
+	PROCEDURE Command(VAR device: Device; cmd: CHAR; lba, num: LONGINT);
+	VAR port1, sector, cylinder, head, x: LONGINT;
+	BEGIN
+		port1 := controllers[device.ctrlId].port1;
+		ASSERT((num > 0) & (num <= 100H));
+		SYSTEM.PORTOUT(port1 + 2, CHR(num MOD 100H));	(* 0 means 256 *)
+		IF LBABit IN device.id.type THEN
+			ASSERT((lba >= 0) & (lba < 10000000H));
+			SYSTEM.PORTOUT(port1 + 3, CHR(lba MOD 100H));
+			SYSTEM.PORTOUT(port1 + 4, CHR(ASH(lba, -8) MOD 100H));
+			SYSTEM.PORTOUT(port1 + 5, CHR(ASH(lba, -16) MOD 100H));
+			SYSTEM.PORTOUT(port1 + 6, CHR((40H + ASH(device.devNum, 4) + ASH(lba, -24) MOD 10H)))
+		ELSE
+			sector := lba MOD device.chs.spt + 1; x := lba DIV device.chs.spt;
+			head := x MOD device.chs.hds; cylinder := x DIV device.chs.hds;
+			ASSERT((sector < 100H) & (cylinder < 10000H) & (head < 10H));
+			SYSTEM.PORTOUT(port1 + 3, CHR(sector));
+			SYSTEM.PORTOUT(port1 + 4, CHR(cylinder MOD 100H));
+			SYSTEM.PORTOUT(port1 + 5, CHR(cylinder DIV 100H));
+			SYSTEM.PORTOUT(port1 + 6, CHR((ASH(device.devNum, 4) + head)))
+		END;
+		SYSTEM.PORTOUT(port1 + 7, cmd)
+	END Command;
+	
+	PROCEDURE ExecuteATACommand(port1, port2: LONGINT; cmd: CHAR; VAR ok: BOOLEAN);
+	VAR x: CHAR;
+	BEGIN
+		SYSTEM.PORTOUT(port1 + 7, cmd);
+		Wait(1);
+		WaitStatus(port1, {BSY}, {}, {ERR}, IOTimeout, ok);
+		IF ok THEN
+			SYSTEM.PORTIN(port2, x) (* ensure status is valid *)
+		END
+	END ExecuteATACommand;
+		
+	PROCEDURE InitDevice(port1, port2, devNum: LONGINT; type: SET; chs: CHS; VAR ok: BOOLEAN);
+	VAR x: CHAR; sector, head: LONGINT;
+	BEGIN
+		IF AtapiBit IN type THEN ok := TRUE
+		ELSE
+			sector := chs.spt; head := chs.hds;
+			SYSTEM.PORTOUT(port1 + 2, CHR(sector));
+			SYSTEM.PORTOUT(port1 + 3, 0X);
+			SYSTEM.PORTOUT(port1 + 4, 0X);
+			SYSTEM.PORTOUT(port1 + 5, 0X);
+			SYSTEM.PORTOUT(port1 + 6, CHR((ASH(devNum, 4) + (head-1) MOD 10H)));
+			SYSTEM.PORTOUT(port1 + 7, 091X); (* initialize device parameters *)
+			SYSTEM.PORTIN(port2, x);
+			WaitStatus(port1, {BSY}, {}, {ERR}, ResetTimeout, ok);
+			IF ~ok THEN
+				IF LBABit IN type THEN 
+					ok := TRUE; 
+					IF Trace THEN Output.Text("Using LBA mode"); Output.Line END
+				END
+			END
+		END
+	END InitDevice;
+		
+	PROCEDURE SelectDevice(port, devNum, timeout: LONGINT; VAR ok: BOOLEAN);
+	BEGIN
+		SYSTEM.PORTOUT(port + 6, CHR(ASH(devNum, 4)));
+		Wait(1);
+		WaitStatus(port, {DRQ,BSY}, {}, {}, timeout, ok);
+		IF Trace & ~ok THEN Output.Text("Device select failed"); Output.Line END
+	END SelectDevice;
+	
+	(* Block port input instruction. *)
+	PROCEDURE -RepInWord(port: LONGINT; bufAdr: Address; len: LONGINT);
+	CODE {SYSTEM.i386}
+		MOV EAX, EDI
+		POP ECX
+		POP EDI
+		POP EDX
+		PUSH EAX
+		CLD
+		REP INSW
+		POP EDI
+	END RepInWord;
+	
+	(* Block port out instruction. *)	
+	PROCEDURE -RepOutWord(port: LONGINT; bufAdr: Address; len: LONGINT);
+	CODE {SYSTEM.i386}
+		MOV EAX, ESI
+		POP ECX
+		POP ESI
+		POP EDX
+		PUSH EAX
+		CLD
+		REP OUTSW
+		POP ESI
+	END RepOutWord;
+	
+	PROCEDURE WaitNotBusy(port2: LONGINT);
+	VAR x: CHAR; startTicks: CARDINAL;
+	BEGIN
+		SYSTEM.PORTIN(port2, x);
+		IF 7 IN SYSTEM.VAL(SET, LONG(ORD(x))) THEN
+			startTicks := Interrupts.timerTicks;
+			REPEAT
+				SYSTEM.PORTIN(port2, x)
+			UNTIL ~(7 IN SYSTEM.VAL(SET, LONG(ORD(x))));
+			REPEAT UNTIL Interrupts.timerTicks >= startTicks + 11;
+			SYSTEM.PORTIN(port2, x)
+		END
+	END WaitNotBusy;
+		
+	PROCEDURE IdentifyAtapi(port1, port2: LONGINT; VAR blockSize, totalSize: LONGINT; VAR id: ID; VAR ok: BOOLEAN);
+	VAR x: CHAR; buf: ARRAY BS DIV 2 OF INTEGER;
+	BEGIN
+		SYSTEM.PORTOUT(port1 + 7, 0A1X); (* identify ATAPI device *)
+		SYSTEM.PORTIN(port2, x); (* ensure status ok *)
+		WaitStatus(port1, {BSY}, {}, {}, IdentifyTimeout, ok);
+		IF ok THEN
+			INCL(id.type, AtapiBit);
+			RepInWord(port1, SYSTEM.ADR(buf[0]), BS DIV 2);
+			IF 7 IN SYSTEM.VAL(SET, LONG(buf[0])) THEN
+				INCL(id.type, RemovableBit);
+				IF (4 IN SYSTEM.VAL(SET, LONG(buf[83]))) OR (0 IN SYSTEM.VAL(SET, LONG(buf[127]))) THEN 
+					INCL(id.type, RMSNBit) 
+				END
+			END;
+			IF 0 IN SYSTEM.VAL(SET, LONG(buf[0])) THEN INCL(id.type, Packet16Bit) END;
+			IF 8 IN SYSTEM.VAL(SET, LONG(buf[49])) THEN INCL(id.type, DMABit) END;
+			GetATAString(buf, 27, 46, id.model);
+			id.devtype := ASH(buf[0], -8) MOD 20H;
+			IF (buf[80] # -1) & (buf[81] # -1) THEN
+				id.ver := ASH(LONG(buf[80]) MOD 10000H, 16) + LONG(buf[81]) MOD 10000H
+			END;
+			IF Packet16Bit IN id.type THEN 
+				ok := FALSE; 
+				IF Trace THEN Output.Text("ATAPI device with 16-bit packets not supported"); Output.Line END
+			ELSIF ~(RemovableBit IN id.type) THEN 
+				ATAPIReadCapacity(port1, port2, blockSize, totalSize, ok)
+			ELSE ok := TRUE
+			END
+		END
+	END IdentifyAtapi;
+	
+	(* Convert an ATA identify string to a readable format. *)
+	PROCEDURE GetATAString(VAR buf: ARRAY OF INTEGER; from, to: LONGINT; VAR s: ARRAY OF CHAR);
+	VAR i, j: LONGINT;
+	BEGIN
+		FOR i := from TO to DO
+			s[2*(i-from)] := CHR(buf[i] DIV 100H MOD 100H);
+			s[2*(i-from)+1] := CHR(buf[i] MOD 100H)
+		END;
+		s[2*(to-from+1)] := 0X;
+		i := 0; j := 0;
+		WHILE s[i] # 0X DO
+			IF (s[i] >= 20X) & (s[i] <= 7EX) THEN s[j] := s[i]; INC(j) END;
+			INC(i);
+			IF (j # 0) & (s[j-1] = 20X) THEN
+				WHILE s[i] = 20X DO INC(i) END
+			END
+		END;
+		IF (j # 0) & (s[j-1] = 20X) THEN DEC(j) END;
+		s[j] := 0X
+	END GetATAString;
+	
+	(* Send Read Capacity command *)
+	PROCEDURE ATAPIReadCapacity(port1, port2: LONGINT;  VAR blockSize, totalSize: LONGINT; VAR ok: BOOLEAN);
+	VAR packet: Packet; buf: ARRAY 2 OF LONGINT; sense: LONGINT;
+	BEGIN
+		ATAPIComposePacket(packet, 25X, 0, 0); (* read capacity *)
+		ATAPISubmit(port1, port2, packet, TRUE, SYSTEM.ADR(buf[0]), 8, sense, ok);
+		IF ok THEN
+			totalSize := buf[0]; blockSize := buf[1];
+			Swap(totalSize); Swap(blockSize);
+			INC(totalSize) (* read capacity returns the last sector *)
+		END
+	END ATAPIReadCapacity;
+	
+	PROCEDURE Swap(VAR a: ARRAY OF SYSTEM.BYTE);
+	VAR x: SYSTEM.BYTE;
+	BEGIN
+		x := a[0]; a[0] := a[3]; a[3] := x;
+		x := a[1]; a[1] := a[2]; a[2] := x;
+	END Swap;
+	
+	PROCEDURE ATAPIComposePacket(VAR packet: Packet; cmd: CHAR; lba, num: LONGINT);
+	BEGIN
+		packet[0] := cmd; packet[1] := 0X;
+		packet[2] := CHR(ASH(lba, -24) MOD 100H);
+		packet[3] := CHR(ASH(lba, -16) MOD 100H);
+		packet[4] := CHR(ASH(lba, -8) MOD 100H);
+		packet[5] := CHR(lba MOD 100H); packet[6] := 0X;
+		packet[7] := CHR(ASH(num, -8) MOD 100H);
+		packet[8] := CHR(num MOD 100H);
+		packet[9] := 0X; packet[10] := 0X; packet[11] := 0X;
+		packet[12] := 0X; packet[13] := 0X; packet[14] := 0X; packet[15] := 0X
+	END ATAPIComposePacket;
+	
+	PROCEDURE ATAPISubmit(port1, port2: LONGINT; packet: Packet; read: BOOLEAN; bufAdr: Address; size: LONGINT; 
+		VAR sense: LONGINT; VAR ok: BOOLEAN);
+	VAR retry, doSense: BOOLEAN; x: CHAR;
+	BEGIN
+		REPEAT
+			retry := FALSE; sense := 0;
+			ATAPIPacket(port1, port2, packet, read, bufAdr, size, doSense, ok);
+			IF (ok & doSense) OR ~ok THEN
+				ok := FALSE; 
+				sense := ATAPISense(port1, port2);
+				IF sense DIV 100H = 29H THEN (* attention + power on, ignore *)
+					retry := TRUE
+				ELSIF sense = 0401H THEN (* failed because getting ready, repeat *)
+					Wait(1); retry := TRUE
+				ELSIF sense = 2800H THEN (* not ready, (medium change) repeat *)
+					ok := FALSE
+				ELSIF sense = 3A00H THEN
+					ok := FALSE
+				END
+			END
+		UNTIL ~retry
+	END ATAPISubmit;
+	
+	(* Transfer a packet and read/write data *)
+	PROCEDURE ATAPIPacket(port1, port2: LONGINT; packet: Packet; read: BOOLEAN; bufAdr: Address; size: LONGINT; 
+		VAR sense: BOOLEAN; VAR ok: BOOLEAN);
+	VAR len, avail: LONGINT; low, high, x: CHAR;
+	BEGIN
+		SYSTEM.PORTOUT(port1 + 1, 0X); (* no OVL, no DMA *)
+		SYSTEM.PORTOUT(port1 + 2, 0X); (* tag 0 *)
+		SYSTEM.PORTOUT(port1 + 4, 0FEX); (* byte count limit *)
+		SYSTEM.PORTOUT(port1 + 5, 0FFX);
+		SYSTEM.PORTOUT(port1 + 7, 0A0X); (* packet *)
+		Wait(1); 
+		WaitStatus(port1, {DRQ,BSY}, {DRQ}, {}, SelectTimeout, ok);
+		IF ok THEN
+			len := 6;
+			RepOutWord(port1, SYSTEM.ADR(packet[0]), len);
+			SYSTEM.PORTIN(port2, x); (* ensure status is valid *)
+		END;
+		WHILE ok & (size > 0) DO
+			WaitStatus(port1, {DRQ,BSY}, {DRQ}, {ERR}, IOTimeout, ok); 
+			IF ok THEN
+				SYSTEM.PORTIN(port1 + 4, low); SYSTEM.PORTIN(port1 + 5, high);
+				avail := LONG(ORD(low)) + LONG(ORD(high)) * 100H;
+				IF avail > size THEN avail := size END;
+				IF read THEN RepInWord(port1, bufAdr, avail DIV 2)
+				ELSE RepOutWord(port1, bufAdr, avail DIV 2)
+				END;
+				INC(bufAdr, UNSIGNED(avail)); DEC(size, avail)
+			END
+		END;
+		IF ok THEN
+			WaitStatus(port1, {BSY, DRDY}, {DRDY}, {}, IOTimeout, ok); 
+			IF ok THEN
+				SYSTEM.PORTIN(port1 + 7, x);
+				sense :=  ODD(ORD(x)) & ((ORD(x) DIV 10H) # 0)
+			END
+		ELSIF Trace THEN Output.Text("ATAPI packet transfer failed"); Output.Line
+		END
+	END ATAPIPacket;
+	
+	(* Perform a SCSI Sense Command *)
+	PROCEDURE ATAPISense(port1, port2: LONGINT): LONGINT;
+	VAR packet: Packet; sense: LONGINT; buf: ARRAY 18 OF CHAR; dummy: BOOLEAN; ok: BOOLEAN;
+	BEGIN
+		ATAPIComposePacket(packet, 03X, 0, 0); (* Request Sense *)
+		packet[4] := 12X; (* buffer size *)
+		ATAPIPacket(port1, port2, packet, TRUE, SYSTEM.ADR(buf[0]), 18, dummy, ok);
+		sense := ORD(buf[12])*100H + ORD(buf[13]);
+		IF ~ok THEN sense := -1 END;
+		RETURN sense
+	END ATAPISense;
+	
+	PROCEDURE ATAPIFlushSenses(port1, port2: LONGINT);
+	VAR sense, p: LONGINT;
+	BEGIN
+		p := 5; sense := ATAPISense(port1, port2); (* remove pending messages *)
+		WHILE (sense > 0) & (p > 0) DO
+			DEC(p); sense := ATAPISense(port1, port2)
+		END
+	END ATAPIFlushSenses;
+		
+	PROCEDURE ATAPITestReady(port1, port2: LONGINT; VAR ok: BOOLEAN);
+	VAR packet: Packet; sense: LONGINT;
+	BEGIN
+		ATAPIComposePacket(packet, 0X, 0, 0);
+		ATAPISubmit(port1, port2, packet, TRUE, 0, 0, sense, ok)
+	END ATAPITestReady;
+	
+	PROCEDURE GetATAPISize(VAR controller: Controller; VAR device: Device; VAR blockSize, totalSize: LONGINT; 
+		VAR ok: BOOLEAN);
+	BEGIN
+		ASSERT((RemovableBit IN device.id.type) & (AtapiBit IN device.id.type));
+		SelectDevice(controller.port1, device.devNum, SelectTimeout, ok);
+		IF ok THEN
+			ATAPITestReady(controller.port1, controller.port2, ok);
+			IF ok THEN
+				ATAPIReadCapacity(controller.port1, controller.port2, blockSize, totalSize, ok);
+				IF ok & (device.id.devtype = 5) & (blockSize # 2048) THEN blockSize := 2048  END (* user data field only *)
+			END
+		END
+	END GetATAPISize;
+	
+	PROCEDURE EjectMedia(port1, port2: LONGINT; atapi: BOOLEAN; VAR ok: BOOLEAN);
+	VAR packet: Packet; sense: LONGINT;
+	BEGIN
+		IF atapi THEN
+			ATAPIComposePacket(packet, 1BX, 0, 0); (* read capacity *)
+			packet[4] := 2X; (* eject media *)
+			ATAPISubmit(port1, port2, packet, TRUE, 0, 0, sense, ok)
+		ELSE
+			ExecuteATACommand(port1, port2, 0EDX, ok) (* media eject *)
+		END
+	END EjectMedia;
+	
+	PROCEDURE RMSNEnable(port1: LONGINT; VAR ok: BOOLEAN);
+	VAR x: CHAR;
+	BEGIN
+		SYSTEM.PORTOUT(port1 + 1, 95X); 
+		SYSTEM.PORTOUT(port1 + 2, 0X);
+		SYSTEM.PORTOUT(port1 + 3, 0X);
+		SYSTEM.PORTOUT(port1 + 4, 0X);
+		SYSTEM.PORTOUT(port1 + 5, 0X);
+		SYSTEM.PORTOUT(port1 + 7, 0EFX); 
+		Wait(1);
+		WaitStatus(port1, {BSY}, {}, {ERR}, ResetTimeout, ok);
+		IF ok THEN
+			SYSTEM.PORTIN(port1 + 5, x)
+		END
+	END RMSNEnable;
+	
+	PROCEDURE RMSNDisable(port1: LONGINT; VAR ok: BOOLEAN);
+	VAR x: CHAR;
+	BEGIN
+		SYSTEM.PORTOUT(port1 + 1, 31X); 
+		SYSTEM.PORTOUT(port1 + 4, 0X);
+		SYSTEM.PORTOUT(port1 + 5, 0X);
+		SYSTEM.PORTOUT(port1 + 7, 0EFX); 
+		Wait(1);
+		WaitStatus(port1, {BSY}, {}, {ERR}, ResetTimeout, ok);
+		IF ok THEN
+			SYSTEM.PORTIN(port1 + 5, x)
+		END
+	END RMSNDisable;
+		
+	PROCEDURE IdentifyATA(port: LONGINT; VAR chs: CHS; VAR size: LONGINT; VAR id: ID; VAR ok: BOOLEAN);
+	VAR size1: LONGINT; buf: ARRAY BS DIV 2 OF INTEGER;
+	BEGIN
+		RepInWord(port, SYSTEM.ADR(buf[0]), BS DIV 2);
+		chs.cyls := LONG(buf[1]) MOD 10000H;
+		chs.hds := LONG(buf[3]) MOD 10000H;
+		chs.spt := LONG(buf[6]) MOD 10000H;
+		
+		size := ASH(LONG(buf[61]) MOD 10000H, 16) + LONG(buf[60]) MOD 10000H;
+		IF size >= MinLBA THEN INCL(id.type, LBABit) END;
+		size1 := chs.cyls * chs.hds * chs.spt;
+		
+		IF size < size1 THEN size := size1 END;
+		IF SYSTEM.VAL(SET, LONG(buf[0])) * {6,7} = {7} THEN
+			INCL(id.type, RemovableBit);
+			IF (4 IN SYSTEM.VAL(SET, LONG(buf[83]))) OR (0 IN SYSTEM.VAL(SET, LONG(buf[127]))) THEN 
+				INCL(id.type, RMSNBit) 
+			END
+		END;
+		INCL(id.type, DMABit); (* DMA support mandatory in ATA/ATAPI-4 *)
+		GetATAString(buf, 27, 46, id.model);
+		IF (buf[80] # -1) & (buf[81] # -1) THEN
+			id.ver := ASH(LONG(buf[80]) MOD 10000H, 16) + LONG(buf[81]) MOD 10000H
+		END;
+		IF ~((chs.hds <= 16) & (chs.spt <= 255)) THEN 
+			ok := FALSE; 
+			IF Trace THEN Output.Text("ATA disk too large, not supported"); Output.Line END
+		ELSIF id.type * {RemovableBit, RMSNBit} = {RemovableBit} THEN 
+			ok := FALSE; 
+			IF Trace THEN Output.Text("Removable ATA disk device not supported"); Output.Line END
+		ELSE ok := TRUE
+		END
+	END IdentifyATA;
+							
+	PROCEDURE IdentifyDevice(VAR controller: Controller; dev: LONGINT; 
+		VAR chs: CHS; VAR blkSize, size: LONGINT; VAR id: ID; VAR ok: BOOLEAN);
+	VAR success: BOOLEAN; x: CHAR;
+	BEGIN
+		ok := TRUE;
+		id.type := {}; id.ver := 0; chs.cyls := 0; chs.hds := 0; chs.spt := 0; size := 0;
+		IF controller.port1 # 0 THEN
+			Wait(50000); (* 50ms *)
+			SelectDevice(controller.port1, dev, IdentifyTimeout, success);
+			IF success THEN
+				ResetControllerInterrupt(controller);
+				SYSTEM.PORTOUT(controller.port1 + 7, 0ECX); (* identify device *)
+				AwaitControllerInterrupt(controller, IdentifyTimeout, success);
+				IF success THEN
+					WaitNotBusy(controller.port2);
+					SYSTEM.PORTIN(controller.port1 + 5, x); (* signature byte *)
+					IF x = 0EBX THEN
+						IdentifyAtapi(controller.port1, controller.port2, blkSize, size, id, success)
+					ELSE
+						IdentifyATA(controller.port1, chs, size, id, success); blkSize := BS;
+						IF success & (size = 0) THEN ok := FALSE END
+					END
+				ELSE ok := FALSE
+				END
+			END;
+			Wait(50000); (* 50ms *)
+			SYSTEM.PORTOUT(controller.port1 + 6, 0X); (* select device 0 again *)
+			Wait(1)
+		ELSE ok := FALSE
+		END
+	END IdentifyDevice;
+		
+	PROCEDURE CreateDevice(VAR controller: Controller; VAR device: Device; ctrlId, devId: LONGINT; 
+		chs: CHS; blockSize, totalSize: LONGINT; id: ID; VAR ok: BOOLEAN);
+	VAR x: CHAR;
+	BEGIN
+		ok := TRUE;
+		device.enabled := TRUE; device.devId := devId; 
+		device.ctrlId := ctrlId; device.devNum := devId MOD 2; device.initialized := FALSE;
+		device.id := id; device.totalSize := totalSize; device.blockSize := blockSize; 
+		device.chs := chs; device.geometry := chs;
+		device.openCount := 0;
+		IF AtapiBit IN id.type THEN
+			SYSTEM.PORTOUT(controller.port1+ 6, CHR(ASH(device.devNum, 4)));
+			SYSTEM.PORTOUT(controller.port1+ 7, 8X); (* reset packet device *)
+			SYSTEM.PORTIN(controller.port2, x);
+			WaitStatus(controller.port1, {BSY}, {}, {}, ResetTimeout, ok);
+			IF ~ok THEN 
+				IF Trace THEN Output.Text("IDE"); Output.Integer(devId); Output.Text(" reset failed"); Output.Line END
+			ELSE
+				ATAPIFlushSenses(controller.port1, controller.port2);
+				ATAPITestReady(controller.port1, controller.port2, ok)
+				(* undocumented: the first command after ResetDevice shall be a PACKET command, other
+					commands like SetFeatures otherwise abort. *)
+			END
+		ELSE
+			IF device.totalSize > 16383 * 16 * 63 THEN
+				device.geometry.cyls := device.totalSize DIV (device.geometry.hds * device.geometry.spt)
+			END
+		END;
+		IF ~(AtapiBit IN id.type) THEN ResetController(controller) END;
+		ok := ok & controller.enabled
+	END CreateDevice;
+		
+	PROCEDURE IdentifyDevices;
+	VAR devId, ctrlId: LONGINT; chs: CHS; blockSize, totalSize: LONGINT; id: ID; ok: BOOLEAN; 
+	BEGIN
+		FOR devId := 0 TO NofDevices-1 DO
+			ctrlId := devId DIV 2;
+			IF controllers[ctrlId].enabled THEN
+				IdentifyDevice(controllers[ctrlId], devId MOD 2, chs, blockSize, totalSize, id, ok);
+				IF ok THEN
+					CreateDevice(controllers[ctrlId], devices[devId], ctrlId, devId, chs, blockSize, totalSize, id, ok);
+					IF Trace THEN
+						Output.Text("IDE"); Output.Integer(devId); Output.Text(" "); Output.Text(devices[devId].id.model); 
+						IF ~(AtapiBit IN id.type) & ~ok THEN Output.Text(": RESET FAILED") END;
+						Output.Line
+					END
+				ELSE devices[devId].enabled := FALSE
+				END
+			END
+		END
+	END IdentifyDevices;
+	
+	PROCEDURE ControllerInterruptHandler(VAR state: Interrupts.InterruptState);
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO NofControllers-1 DO
+			IF controllers[i].enabled & (Interrupts.IRQ0 + controllers[i].irq = state.INT) THEN
+				controllers[i].interrupt := TRUE
+			END
+		END
+	END ControllerInterruptHandler;
+	
+	PROCEDURE AwaitControllerInterrupt(VAR controller: Controller; timeOutMs: LONGINT; VAR ok: BOOLEAN);
+	CONST K = 1000;
+	VAR startTicks: CARDINAL; i: LONGINT;
+	BEGIN
+		ASSERT(Processors.InterruptsEnabled());
+		startTicks := Interrupts.timerTicks; i := 0;
+		WHILE ~controller.interrupt & (Interrupts.timerTicks < startTicks + timeOutMs + 1) DO
+			INC(i); IF i < K THEN Wait(1) ELSE Wait(1000) END
+		END;
+		ok := controller.interrupt;
+		controller.interrupt := FALSE
+	END AwaitControllerInterrupt;
+				
+	PROCEDURE ResetControllerInterrupt(VAR controller: Controller);
+	BEGIN controller.interrupt := FALSE
+	END ResetControllerInterrupt;
+				
+	PROCEDURE ResetController(VAR controller: Controller);
+	BEGIN
+		SYSTEM.PORTOUT(controller.port2, 4X); Wait(5);
+		SYSTEM.PORTOUT(controller.port2, 8X); Wait(2000);
+		WaitStatus(controller.port1, {BSY}, {}, {}, ResetTimeout, controller.enabled)
+	END ResetController;
+	
+	PROCEDURE Wait(us: LONGINT); (* micro-seconds *)
+	BEGIN
+		IF us >= 1000 THEN 
+			Concurrency.Wait(us DIV 1000 + 1)
+		ELSE
+			ASSERT(us >= 0);
+			Concurrency.SpinWait(UNSIGNED(us))
+		END
+	END Wait;
+	
+	(* wait for specific status word *)
+	PROCEDURE WaitStatus(port1: LONGINT; mask, expect, bad: SET; ms: LONGINT; VAR ok: BOOLEAN);
+	VAR startTicks: CARDINAL; s: SET; ch: CHAR;
+	BEGIN
+		startTicks := Interrupts.timerTicks;
+		REPEAT
+			SYSTEM.PORTIN(port1 + 7, ch); s := SYSTEM.VAL(SET, LONG(ORD(ch)))
+		UNTIL (s * mask = expect) OR (s * bad # {}) OR (Interrupts.timerTicks >= startTicks + ms + 1);
+		ok := (s * mask = expect) & (s * bad = {})
+	END WaitStatus;
+	
+	(* wait for specific alternate status bits *)
+	PROCEDURE WaitAltStatus(port1, port2: LONGINT; mask, expect, bad: SET; ms: LONGINT; VAR ok: BOOLEAN);
+	VAR startTicks: CARDINAL; s: SET; ch: CHAR;
+	BEGIN
+		startTicks := Interrupts.timerTicks;
+		REPEAT
+			SYSTEM.PORTIN(port2, ch); s := SYSTEM.VAL(SET, LONG(ORD(ch)))
+		UNTIL (s * mask = expect) OR (s * bad # {}) OR (Interrupts.timerTicks >= startTicks + ms + 1);
+		ok := (s * mask = expect) & (s * bad = {})
+	END WaitAltStatus;
+	
+	PROCEDURE InitController(VAR controller: Controller; id, irq, port: LONGINT);
+	BEGIN 
+		controller.ctrlId := id;
+		controller.irq := irq; controller.port1 := port; controller.port2 := port + 206H;
+		ResetController(controller);
+		IF controller.enabled THEN
+			Interrupts.InstallInterruptHandler(Interrupts.IRQ0 + irq, ControllerInterruptHandler);
+			Interrupts.EnableIRQ(Interrupts.IRQ0 + irq)
+		END
+	END InitController;
+
+	PROCEDURE InitControllers;
+	BEGIN
+		InitController(controllers[0], 0, 14, 01F0H);
+		InitController(controllers[1], 1, 15, 0170H)
+	END InitControllers;
+		
+	PROCEDURE Initialize*;
+	BEGIN
+		ASSERT(~initialized);
+		Lock; 
+		InitControllers;
+		IdentifyDevices;
+		Unlock;
+		initialized := TRUE
+	END Initialize;
+	
+	PROCEDURE Lock;
+	BEGIN Concurrency.Lock(lock)
+	END Lock;
+	
+	PROCEDURE Unlock;
+	BEGIN Concurrency.Unlock(lock)
+	END Unlock;
+
+BEGIN
+	Concurrency.InitializeLock(lock);
+	initialized := FALSE
+END ComDiskDriver.
+

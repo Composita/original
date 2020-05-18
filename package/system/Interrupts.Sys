@@ -1,0 +1,661 @@
+MODULE Interrupts; (** Kernel, Interrupt Resources, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Output, Memory, Processors;
+	
+	(** 
+		Generic interrupt support
+		Based on Pieter Muller's Aos implementation
+		
+		Lock policy for interrupts:
+		- Processor spin-locks are not interruptible, except for software interrupts (trap) and non-maskable hardware interrupts.
+	    - Preemption must be disabled during execution of kernel code (kernel module)
+	    - A non-maskable interrupt handler must not use locks (if the current processors has already acquired some)
+		=> an interrupt handler does not violate the lock order and does not acquire nested locks => deadlock exclusion
+	*)
+	
+	TYPE 
+		Interrupt* = LONGINT;
+	
+	CONST
+	(** 
+		Pre-defined interrupts 0-31 (see IA32, vol3, chapter 5)
+		Interrupt  Meaning 
+		0			  DE (Divide Error Exception)
+		1			  DB (Debug Exception)
+		2			  NMI (Non-Maskable Hardware Interrupt)
+		3			  BP (Breakpoint Exception)
+		4			  OV (Overflow Exception)
+		5			  BR (Bound Range Exceeded Exception)
+		6			  UD (Invalid Opcode Exception)
+		7			  NM (Device Not Available Exception)
+		8			  DF (Double Faule Exception)
+		9			  Coprocessor Segment Overrun
+		10			TS (Invalid TSS Exception)
+		11			NP (Segment Not Present)
+		12			SS (Stack Fault Exception)
+		13			GP (General Protection Fault)
+		14			PF (Page Fault Exception)
+		16			MF (x87 FPU Exception)
+		17			AC (Alignment Check Exception)
+		18			MC (Machine Check Exception)
+		19			XF (SIMD Floating-Point Exception)
+	*)
+		DE* = 0;  DB* = 1;  NMI* = 2;  BP* = 3;  OV* = 4;  BR* = 5;  UD* = 6;  NM* = 7; DF* = 8;  
+		TS* = 10;  NP* = 11;  SSF* = 12;  GP* = 13;  PF* = 14;  MF*= 16;  AC*= 17; MC* = 18; XF* = 19;
+	
+	CONST
+	(** 
+		IRQ	Common use  (ordered by descending priority)
+		00	Timer
+		01	Keyboard
+		08	RT clock
+		09	EGA/VGA retrace
+		10	Ethernet or other card
+		11	card
+		12	PS/2 mouse or card
+		13	DMA/copro
+		14	Hard disk
+		15	card or IRQ error
+		03	COM2/4
+		04	COM1/3
+		05	card
+		06	Diskette
+		07	LPT1 or IRQ error 
+	*)
+		IRQ0* = 32; IRQ1* = IRQ0+1; IRQ2* = IRQ0+2; IRQ3* = IRQ0+3; IRQ4* = IRQ0+4; IRQ5* = IRQ0+5;
+		IRQ6* = IRQ0+6; IRQ7* = IRQ0+7; IRQ8* = IRQ0+8; IRQ9* = IRQ0+9; IRQ10* = IRQ0+10; IRQ11* = IRQ0+11;
+		IRQ12* = IRQ0+12; IRQ13* = IRQ0+13; IRQ14* = IRQ0+14; IRQ15* = IRQ0+15;
+			
+		SpuriousIRQ = IRQ7;
+		IgnoreSpurious = TRUE;
+		
+	CONST
+		IntA0 = 020H; IntA1 = 021H;	(* Interrupt Controller 1 *)
+		IntB0 = 0A0H; IntB1 = 0A1H;	(* Interrupt Controller 2 *)
+
+	TYPE
+		InterruptState* = RECORD
+			EDI*, ESI*: CARDINAL;
+			ERR*: LONGINT;
+			ESP0*, EBX*, EDX*, ECX*, EAX*: CARDINAL;	(** ESP0 = ADR(s.INT) *)
+			INT*: LONGINT;
+			EBP*, EIP*, CS*: CARDINAL;	(* EBP and ERR are exchanged by glue code, for procedure link *)
+			EFLAGS*: SET;
+			ESP*, SS*: CARDINAL (** only valid if privilege change (current CS() MOD 4 < InterruptState.CS MOD 4) *)
+		END;
+	
+		(* interrupt descriptor table *)
+	CONST
+		IDTSize = 64;
+	TYPE
+		(* See IA32, vol 3, 5.11, interrupt gate *)
+		GateDescriptor = RECORD
+			offsetBits0To15: INTEGER;
+			segmentSelector: INTEGER;
+			gateType: INTEGER;
+			offsetBits16To31: INTEGER
+		END;
+		IDT = ARRAY IDTSize OF GateDescriptor;
+				
+		(** APIC support, see IA32, vol 3, chapter 8, and 7.5.4 *)
+	CONST
+		(** APIC interrupts for SMP *)
+		APICKC* = 49;	(** SMP kernel call *)
+		APICIPCLocal* = 59; (** SMP local interprocessor interrupt *)
+		APICTMR* = 60;	(** SMP timer interrupt (needed for MP timeslicing) *)
+		APICIPC* = 61;	(** SMP interprocessor interrupt *)
+		APICERR* = 62;	(** SMP error interrupt *)
+		APICSPU* = 63;	(** SMP spurious interrupt (MOD 16 = 15)*)
+
+	CONST
+		(* APIC registers *)
+		APICSVR = Processors.APICAddress + 0F0H; (* APIC spurious vector register *)
+		APICLVTTMR = Processors.APICAddress + 320H; (* APIC LVT timer register *)
+		APICLVT3 = Processors.APICAddress + 370H; (* APIC local vector table *)
+		APICInitCount = Processors.APICAddress + 380H; (* APIC initial count register for timer *)
+		APICESR = Processors.APICAddress + 280H; (* APIC error status register *)
+		APICEOI = Processors.APICAddress + 0B0H; (* APIC EOI *)
+		APICICRLow = Processors.APICAddress + 300H; (* APIC interrupt command register *)
+		APICDCR = Processors.APICAddress + 3E0H; (* APIC divide configuration register for timer *)
+		
+	VAR
+		lock: Processors.SpinLock;
+		
+	VAR
+		idt: IDT; (* interrupt descriptor table *)
+		glue: ARRAY IDTSize OF ARRAY 15 OF CHAR; (* code *)
+		interruptStateTag: Memory.Address;
+		genericInterruptHandler: PROCEDURE (VAR state: InterruptState);
+		
+		(** Generic Interrupt Handler *)
+	CONST
+		MaxInterruptHandlers = 4;
+	TYPE
+		InterruptHandler* = PROCEDURE (VAR state: InterruptState);
+		InterruptHandlerList* = ARRAY MaxInterruptHandlers OF InterruptHandler;
+	VAR
+		specificInterruptHandler: ARRAY IDTSize OF InterruptHandlerList;
+	
+	(* Timer interrupt specific *)
+	CONST
+		TimerTickRate* = 1; (** ms *)
+		TimerIRQ* = IRQ0;
+	VAR
+		timerTicks-: CARDINAL;
+	
+	(** Disable interrupts and return old interrupt state. *)
+	PROCEDURE -DisableInterrupts*(): SET;
+	CODE {SYSTEM.i386}
+		PUSHFD
+		CLI
+		POP EAX
+	END DisableInterrupts;
+	
+	(** Restore interrupt state. Interrupt state obtained from preceding DisableInterrupts call. *)
+	PROCEDURE -RestoreInterrupts*(interruptState: SET);
+	CODE {SYSTEM.i386}
+		POPFD
+	END RestoreInterrupts;
+	
+	PROCEDURE InstallInterruptHandler*(int: Interrupt; handler: InterruptHandler);
+	VAR k: LONGINT;
+	BEGIN
+		Processors.AcquireLock(lock);
+		k := 0; WHILE (k < MaxInterruptHandlers) & (specificInterruptHandler[int][k] # NIL) DO INC(k) END;
+		IF k < MaxInterruptHandlers THEN specificInterruptHandler[int][k] := handler END;
+		Processors.ReleaseLock(lock);
+		ASSERT(k < MaxInterruptHandlers, 80) (* no capacity for interrupt handler *)
+	END InstallInterruptHandler;
+	
+	PROCEDURE DeinstallInterruptHandler*(int: Interrupt; handler: InterruptHandler);
+	VAR k: LONGINT;
+	BEGIN
+		Processors.AcquireLock(lock);
+		k := 0; WHILE (k < MaxInterruptHandlers) & (specificInterruptHandler[int][k] # handler) DO INC(k) END;
+		IF k < MaxInterruptHandlers THEN specificInterruptHandler[int][k] := NIL END;
+		Processors.ReleaseLock(lock);
+		ASSERT(k < MaxInterruptHandlers, 81) (* interrupt handler is not installed *)
+	END DeinstallInterruptHandler;
+	
+	(** Enable a hardware interrupt *)
+	PROCEDURE EnableIRQ*(int: Interrupt);
+	BEGIN
+		ASSERT((int >= IRQ0) & (int <= IRQ15) & (int # IRQ2));
+		Processors.AcquireLock(lock);
+		InternalEnableIRQ(int);
+		Processors.ReleaseLock(lock)
+	END EnableIRQ;
+	
+	(** Disable a hardware interrupt *)
+	PROCEDURE DisableIRQ*(int: Interrupt);
+	BEGIN
+		ASSERT((int >= IRQ0) & (int <= IRQ15) & (int # IRQ2));
+		Processors.AcquireLock(lock);
+		InternalDisableIRQ(int);
+		Processors.ReleaseLock(lock)
+	END DisableIRQ;
+	
+	(* lock must be acquired *)
+	PROCEDURE -InternalEnableIRQ(int: LONGINT);
+	CODE {SYSTEM.i386}
+		POP EBX
+		CMP EBX, IRQ7
+		JG cont2
+		IN AL, IntA1
+		SUB EBX, IRQ0
+		BTR EAX, EBX
+		OUT IntA1, AL
+		JMP end
+	cont2:
+		IN AL, IntB1
+		SUB EBX, IRQ8
+		BTR EAX, EBX
+		OUT IntB1, AL
+	end:
+	END InternalEnableIRQ;
+
+	(* lock must be acquired *)
+	PROCEDURE -InternalDisableIRQ(int: LONGINT);
+	CODE {SYSTEM.i386}
+		POP EBX
+		CMP EBX, IRQ7
+		JG cont2
+		IN AL, IntA1
+		SUB EBX, IRQ0
+		BTS EAX, EBX
+		OUT IntA1, AL
+		JMP end
+	cont2:
+		IN AL, IntB1
+		SUB EBX, IRQ8
+		BTS EAX, EBX
+		OUT IntB1, AL
+	end:
+	END InternalDisableIRQ;
+	
+	(* all interrupts are primarily handled by this procedure *)
+	PROCEDURE MainInterruptHandler(VAR state: InterruptState) {UNCHECKED};
+	CONST InterruptStackReserve = 4*Memory.KB; (* of kernel stack *)
+	VAR handler: InterruptHandler; currentStack, kernelStack, stack2: Memory.Stack; stackReserve, stackReserve2: LONGINT;
+		int, halt, k: LONGINT; handled: BOOLEAN; 
+	BEGIN
+		IF IgnoreSpurious & (state.INT = SpuriousIRQ) THEN RETURN END;
+		Memory.GetCurrentStack(currentStack, stackReserve);
+		Memory.GetKernelSystemStack(kernelStack);
+		IF PrivilegeLevelChanged(state) & (ESP() >= kernelStack.low) & (ESP() < kernelStack.high) THEN
+			Memory.SetCurrentStack(kernelStack, InterruptStackReserve) (* also sets the ESI registers for stack boundary checks *)
+		ELSIF ~((ESP() >= kernelStack.low) & (ESP() < kernelStack.high)) THEN
+			Output.Text("Interrupt "); Output.Integer(state.INT); Output.Text(" not on kernel stack ESP="); 
+			Output.HexCardinal(ESP());
+			InterruptOutput(state);
+			Output.Text("SYSTEM HALT"); Output.Line;
+			LOOP END
+		END;
+		
+		(* stack overflow handling *)
+		int := state.INT;
+		IF int = BP THEN
+			IF PrivilegeLevelChanged(state) & (state.ESP < Memory.memorySize) THEN
+				SYSTEM.GET(state.ESP, halt) 
+			ELSE 
+				halt := SYSTEM.VAL(LONGINT, state.ESP)
+			END;
+			IF halt = -15 THEN (* stack overflow *)
+				IF ~PrivilegeLevelChanged(state) & (stackReserve <= InterruptStackReserve) THEN
+					Output.Text("Critical stack overflow"); Output.Line;
+					Output.Text("SYSTEM HALT"); Output.Line;
+					LOOP END
+				END
+			END
+		END;
+		
+		handled := FALSE;
+		FOR k := 0 TO MaxInterruptHandlers-1 DO
+			handler := specificInterruptHandler[int][k];
+			IF handler # NIL THEN
+				handled := TRUE;
+				handler(state);
+				IF Processors.InterruptsEnabled() THEN
+					SYSTEM.CLI; 
+					Output.Text("Warning: Interrupts enabled by interrupt handler INT="); 
+					Output.Integer(state.INT); Output.Line
+				END
+			END
+		END;
+		
+		IF ~handled THEN
+			IF state.INT = SpuriousIRQ THEN 
+				Output.Text("Spurious interrupt"); Output.Line
+			ELSE
+				InterruptOutput(state);
+				Output.Text("Unhandled interrupt"); Output.Line;
+				Output.Text("SYSTEM HALT"); Output.Line;
+				LOOP END
+			END
+		END;
+		
+		Memory.GetCurrentStack(stack2, stackReserve2); (* check whether specific interrupt handler has switched stack *)
+		IF (stack2.low = kernelStack.low) & (stack2.high = kernelStack.high) THEN (* not switched => activate original stack *)
+			Memory.SetCurrentStack(currentStack, stackReserve)
+		END
+	END MainInterruptHandler;
+	
+	PROCEDURE InterruptOutput*(VAR state: InterruptState);
+	VAR halt, k: LONGINT; ebp, eip: CARDINAL; 
+	BEGIN
+		Output.Line;
+		Output.Text("Interrupt INT="); Output.Integer(state.INT);
+		IF (state.INT = BP) OR (state.INT = GP) THEN (* HALT *)
+			IF state.INT = BP THEN
+				IF PrivilegeLevelChanged(state) & (state.ESP + 4 <= Memory.memorySize) THEN 
+					SYSTEM.GET(state.ESP, halt) 
+				ELSE 
+					halt := SYSTEM.VAL(LONGINT, state.ESP)
+				END
+			ELSE
+				halt := -14
+			END;
+			Output.Text(" HALT="); Output.Integer(halt);
+			IF halt = -20 THEN Output.Text(" Integer conversion trap")
+			ELSIF halt = -15 THEN Output.Text(" Stack overflow")
+			ELSIF halt = -14 THEN Output.Text(" NIL trap")
+			ELSIF halt = -13 THEN Output.Text(" Dangling pointer")
+			ELSIF halt = -12 THEN Output.Text(" Memory leak")
+			ELSIF halt = 0 THEN Output.Text(" Division error")
+			ELSIF halt = 1 THEN Output.Text(" WITH guard failed")
+			ELSIF halt = 2 THEN Output.Text(" CASE invalid")
+			ELSIF halt = 3 THEN Output.Text(" RETURN missing")
+			ELSIF halt = 4 THEN Output.Text(" Integer overflow")
+			ELSIF halt = 5 THEN Output.Text(" Implicit type guard failed")
+			ELSIF halt = 6 THEN Output.Text(" Type guard failed")
+			ELSIF halt = 7 THEN Output.Text(" Index out of range")
+			ELSIF halt = 8 THEN Output.Text(" ASSERT failed")
+			ELSIF halt = 9 THEN Output.Text(" Array dimension error")
+			ELSIF halt = 10 THEN Output.Text(" Out of memory")
+			END
+		END;
+		Output.Text(" ERR="); Output.Integer(state.ERR); 
+		Output.Text(" ID="); Output.Integer(Processors.ID()); Output.Line;
+		Output.Text(" EDI="); Output.HexCardinal(state.EDI); 
+		Output.Text(" ESI="); Output.HexCardinal(state.ESI);
+		Output.Text(" ESP0="); Output.HexCardinal(state.ESP0); Output.Line;
+		Output.Text(" EBX="); Output.HexCardinal(state.EBX); 
+		Output.Text(" EDX="); Output.HexCardinal(state.EDX);
+		Output.Text(" ECX="); Output.HexCardinal(state.ECX); 
+		Output.Text(" EAX="); Output.HexCardinal(state.EAX); Output.Line;
+		Output.Text(" EBP="); Output.HexCardinal(state.EBP); 
+		Output.Text(" EIP="); Output.HexCardinal(state.EIP); 
+		Output.Text(" CS="); Output.HexCardinal(state.CS); 
+		Output.Text(" EFLAGS="); Output.HexCardinal(SYSTEM.VAL(CARDINAL, state.EFLAGS)); Output.Line;
+		IF PrivilegeLevelChanged(state) THEN
+			Output.Text("Privilege level changed ");
+			Output.Text(" ESP="); Output.HexCardinal(state.ESP); 
+			Output.Text(" SS="); Output.HexCardinal(state.SS); Output.Line
+		ELSE
+			Output.Text("Same privilege level"); Output.Line
+		END;
+		IF (state.INT = BP) OR (state.INT = GP) THEN
+			Output.Text("Stack frames:"); Output.Line;
+			Output.Text(" EIP="); Output.HexCardinal(state.EIP); 
+			Output.Text(" EBP="); Output.HexCardinal(state.EBP); Output.Line;
+			ebp := state.EBP; k := 0;			
+			WHILE (k < 7) & (ebp >= 4) & (ebp MOD 4 = 0) & (ebp + 4 <= Memory.memorySize) DO
+				SYSTEM.GET(ebp+4, eip); 
+				SYSTEM.GET(ebp, ebp);
+				INC(k);
+				Output.Text(" EIP="); Output.HexCardinal(eip); 
+				Output.Text(" EBP="); Output.HexCardinal(ebp); Output.Line
+			END
+		END
+	END InterruptOutput;
+	
+	PROCEDURE RestartFromTrap*(VAR state: InterruptState; restartPC: Memory.Address) {UNCHECKED};
+	VAR stack: Memory.Stack;
+	CONST IFBit = 9; (* interrupt flag in EFLAGS, see IA32, vol 3, section 2.3 *)
+	BEGIN
+		INCL(state.EFLAGS, IFBit); (* enable interrupts *)
+		Memory.GetUserSystemStack(stack);
+		state.EBP := 0; state.ESP := stack.high;
+		state.EIP := restartPC;
+		Memory.SetCurrentStack(stack, Memory.UserSystemStackReserve);
+		SYSTEM.GETREG(SYSTEM.ESI, state.ESI); (* activate new stack boundary (stored in ESI) for stack overflow checks *) 
+	END RestartFromTrap;
+	
+	PROCEDURE PrivilegeLevelChanged*(VAR state: InterruptState): BOOLEAN {UNCHECKED};
+	BEGIN RETURN CS() MOD 4 # state.CS MOD 4
+	END PrivilegeLevelChanged;
+	
+	PROCEDURE -CS(): CARDINAL;
+	CODE {SYSTEM.i386}
+		XOR EAX, EAX
+		MOV AX, CS
+	END CS;
+	
+	PROCEDURE -ESP(): CARDINAL;
+	CODE {SYSTEM.i386}
+		MOV EAX, ESP
+	END ESP;
+	
+	(* stack state at the entry to MainInterruptHandler procedure:
+		-- IF privilege level changed by interrupt (CS MOD 4 < .CS MOD 4) THEN
+		56	--	.SS
+		52	--	.ESP	; or haltcode
+		-- END
+		48	--	.EFLAGS
+		44	--	.CS
+		40	--	.EIP				; rest popped by IRETD
+		36	--	.ERR -> EBP	  ; EBP exchanged by processor or glue code
+		32	--	.INT	<-- .ESP0 ; pushed by glue code
+		-- Pushed by FieldInterrupt
+		28	--	.EAX
+		24	--	.ECX
+		20	--	.EDX
+		16	--	.EBX
+		12	--	.ESP0
+		08	--	.EBP -> ERR	; error code exchanged by glue code
+		04	--	.ESI
+		00	--	.EDI	<--- state: State
+		--	12	TAG(state)
+		--	08	ADR(state)
+		--	04	EIP'	(RET to FieldInterrupt)
+		--	00	EBP'	<-- EBP
+		--	--	locals	<-- ESP *)
+	PROCEDURE FieldInterrupt;
+	CODE {SYSTEM.i386}
+	entry: (* glue code skips procedure prolog of 3 bytes length *)
+		PUSHAD	; save all general-purpose registers (EBP -> error code)
+		LEA EBP, 36[ESP] ; restore caller EBP
+				
+		MOV EAX, ESP ; address to state
+		PUSH interruptStateTag ; TAG(state)
+		PUSH EAX	    ; ADR(state)
+		MOV EBX, genericInterruptHandler
+		CALL EBX
+		
+		POPAD 			; now EBP = error code
+		POP EBP		   ; now EBP = INT
+		POP EBP		   ; now EBP = caller EBP
+		IRETD
+	END FieldInterrupt;
+	
+	PROCEDURE FieldIRQ;
+	CODE {SYSTEM.i386}
+	entry: (* glue code skips procedure prolog of 3 bytes length *)
+		PUSHAD	; save all general-purpose registers (EBP -> error code)
+		LEA EBP, 36[ESP] ; restore caller EBP
+		
+		MOV EAX, ESP ; address to state
+		PUSH interruptStateTag ; TAG(state)
+		PUSH EAX	    ; ADR(state)
+		MOV EBX, genericInterruptHandler
+		CALL EBX
+		CLI					; handler may have re-enabled interrupts
+		
+		; acknowledge interrupt
+		MOV AL, 20H	; undoc PC ed. 2 p. 1018
+		CMP BYTE 32[ESP], IRQ8
+		JB irq0
+		OUT IntB0, AL	; 2nd controller
+	irq0:
+		OUT IntA0, AL	; 1st controller
+		
+		POPAD 			; now EBP = error code		
+		POP EBP		   ; now EBP = INT
+		POP EBP		   ; now EBP = caller EBP
+		IRETD
+	END FieldIRQ;
+	
+	(* Load interrupt descriptor table *)
+	PROCEDURE LoadIDT(base, size: CARDINAL);
+	CODE {SYSTEM.i386, SYSTEM.Privileged}
+		SHL size[EBP], 16
+		MOV EBX, 2
+		LIDT size[EBP][EBX]
+	END LoadIDT;
+		
+	(* Default timer interrupt handler *) 
+	PROCEDURE TimerInterruptHandler(VAR state: InterruptState) {UNCHECKED};
+	BEGIN INC(timerTicks)
+	END TimerInterruptHandler;
+	
+	PROCEDURE EnableTimer;
+	CONST 
+		TimerClock = 1193180; (* Hz *)
+		Rate = 1000 DIV TimerTickRate;
+		ClockDivisor = (2*TimerClock + Rate) DIV (2*Rate); 
+	BEGIN
+		SYSTEM.PORTOUT(43H, 34X);  IODelay; 
+		SYSTEM.PORTOUT(40H, CHR(ClockDivisor MOD 100H));  IODelay;
+		SYSTEM.PORTOUT(40H, CHR(ASH(ClockDivisor, -8)));
+		InstallInterruptHandler(TimerIRQ, TimerInterruptHandler);
+		EnableIRQ(TimerIRQ)
+	END EnableTimer;
+	
+	PROCEDURE -IODelay;
+	CODE {SYSTEM.i386}
+		JMP 0
+		JMP 0
+		JMP 0
+	END IODelay;
+			
+	(* Initialize APIC for current processor, called once by each processors *)
+	PROCEDURE InitializeAPIC*;
+	CONST APICEnabled = 8; (* bit 8 in APIC SVR *)
+	VAR value: SET;
+	BEGIN
+		(* enable APIC by setting APIC spurious interrupt handler *)
+		SYSTEM.GET(APICSVR, value);
+		INCL(value, APICEnabled);
+		SYSTEM.PUT32(APICSVR, value);
+		(* set APIC LVT3 error handler *)
+		SYSTEM.PUT32(APICLVT3, APICERR)
+	END InitializeAPIC;
+		
+	PROCEDURE APICErrorHandler(VAR state: InterruptState) {UNCHECKED};
+	VAR int: LONGINT; esr: SET;
+	BEGIN
+		int := state.INT; SYSTEM.GET(APICESR, esr);
+		SYSTEM.PUT32(APICEOI, {});
+		Output.Text("APIC Error INT="); Output.Integer(int); Output.Line;
+		HALT(201) (* APIC error *)
+	END APICErrorHandler;
+	
+	PROCEDURE APICKernelCallHandler(VAR state: InterruptState) {UNCHECKED};
+	CONST IFBit = 9; (* interrupt flag in EFLAGS, see IA32, vol 3, section 2.3 *)
+	BEGIN
+		IF state.EAX = 2 THEN	
+			IF IFBit IN state.EFLAGS THEN
+				Processors.Halt;
+				SYSTEM.CLI (* Halt enables interrupt *)
+			END
+		ELSE
+			HALT(111)
+		END
+	END APICKernelCallHandler;
+	
+	PROCEDURE APICIPCHandler(VAR state: InterruptState) {UNCHECKED};
+	BEGIN 
+		(* wakeup signal for halted processors *)
+		SYSTEM.PUT(APICEOI, {})
+	END APICIPCHandler;
+	
+	PROCEDURE InstallAPICHandlers;
+	BEGIN
+		IF Processors.APICFeature IN Processors.features THEN
+			InstallInterruptHandler(APICERR, APICErrorHandler);
+			InstallInterruptHandler(APICKC, APICKernelCallHandler);
+			InstallInterruptHandler(APICIPC, APICIPCHandler)
+		END
+	END InstallAPICHandlers;
+	
+	PROCEDURE ApicStartHaltedProcessors*;
+	BEGIN
+		SYSTEM.PUT32(APICICRLow, {18, 19} + SYSTEM.VAL(SET, APICIPC))
+	END ApicStartHaltedProcessors;
+	
+	(* see IA32, vol 3, chapter 8, and section 7.5.4.1.15 *)
+	PROCEDURE ApicINITBroadcast*;
+	CONST APICInitIPI = 0000C4500H; 
+	BEGIN
+		SYSTEM.PUT32(APICICRLow, APICInitIPI)
+	END ApicINITBroadcast;
+	
+	(* see IA32, vol 3, chapter 8, and section 7.5.4.1.15 *)
+	PROCEDURE ApicSIPIBroadcast*(bootVector: CARDINAL);
+	CONST ApicSIPIIPI = 0000C4600H;
+	VAR sipi: SET;
+	BEGIN
+		ASSERT((bootVector >= 0) & (bootVector <= 100H));
+		sipi := SYSTEM.VAL(SET, ApicSIPIIPI) + SYSTEM.VAL(SET, bootVector);
+		SYSTEM.PUT32(APICICRLow, sipi)
+	END ApicSIPIBroadcast;
+	
+	PROCEDURE ProcessorHalt*;
+	CODE {SYSTEM.i386}
+		MOV EAX, 2
+		INT APICKC
+	END ProcessorHalt;
+			
+	(* Initialize interrupt handling, called once during initialization *)
+	PROCEDURE Initialize;
+	VAR mask: SET; i, k, o: LONGINT; p: PROCEDURE; a: CARDINAL;
+	BEGIN
+		interruptStateTag := SYSTEM.TYPECODE(InterruptState);
+		genericInterruptHandler := MainInterruptHandler;
+		FOR i := 0 TO LEN(specificInterruptHandler)-1 DO 
+			FOR k := 0 TO MaxInterruptHandlers-1 DO specificInterruptHandler[i][k] := NIL END
+		END;
+		
+		(* initialize 8259 interrupt controller chips *)
+		SYSTEM.PORTOUT(IntA0, 11X);  SYSTEM.PORTOUT(IntA1, CHR(IRQ0));
+		SYSTEM.PORTOUT(IntA1, 4X);  SYSTEM.PORTOUT(IntA1, 1X);  SYSTEM.PORTOUT(IntA1, 0FFX);
+		SYSTEM.PORTOUT(IntB0, 11X);  SYSTEM.PORTOUT(IntB1, CHR(IRQ8));
+		SYSTEM.PORTOUT(IntB1, 2X);  SYSTEM.PORTOUT(IntB1, 1X);  SYSTEM.PORTOUT(IntB1, 0FFX);
+		(* enable interrupts from second interrupt controller, chained to line 2 of controller 1 *)
+		SYSTEM.PORTIN(IntA1, SYSTEM.VAL(CHAR, mask));
+		EXCL(mask, IRQ2-IRQ0);
+		SYSTEM.PORTOUT(IntA1, SYSTEM.VAL(CHAR, mask));
+		
+		FOR i := 0 TO IDTSize-1 DO (* set up glue code *)
+			(* The glue code is:
+				entry0:	; entry point for interrupts without error code
+					PUSH 0	; fake error code
+				entry1:	; entry point for interrupts with error code
+					XCHG [ESP], EBP	; exchange error code and caller EBP
+					PUSH int	; interrupt number
+					JMP FieldInterrupt:entry *)
+			o := 0;
+			glue[i][o] := 6AX; INC(o); glue[i][o] := 0X; INC(o); (* PUSH 0 *)
+			glue[i][o] := 87X; INC(o); glue[i][o] := 2CX; INC(o); glue[i][o] := 24X; INC(o); (* XCHG [ESP], EBP *)
+			glue[i][o] := 6AX; INC(o); glue[i][o] := CHR(i); INC(o); (* PUSH i *)
+			IF (i >= IRQ0) & (i <= IRQ15) THEN p := FieldIRQ ELSE p := FieldInterrupt END;
+			a := SYSTEM.VAL(CARDINAL, p)+3 (* 3 = offset of FieldInterrupt.entry *) - (SYSTEM.ADR(glue[i][o])+5); (* relative address *)
+			glue[i][o] := 0E9X; INC(o); (* JMP FieldInterrupt.entry *)
+			SYSTEM.PUT(SYSTEM.ADR(glue[i][o]), a);
+	
+			(* set up IDT entry *)
+			IF (i > 31) OR ~(i IN {8, 10..14, 17}) THEN a := SYSTEM.ADR(glue[i][0]) (* include PUSH 0 *)
+			ELSE a := SYSTEM.ADR(glue[i][2]) (* skip PUSH 0, processor supplies error code *)
+			END;
+		
+			idt[i].offsetBits0To15 := SHORT(SYSTEM.VAL(LONGINT, a MOD 10000H));
+			(* all interrupts are handled at protection level 0 *)
+			idt[i].segmentSelector := Memory.KernelCodeSegmentSelector; 
+			idt[i].gateType := SYSTEM.VAL(INTEGER, 0EE00H); (* present, DPL 3, system, 386 interrupt *)
+			idt[i].offsetBits16To31 := SHORT(SYSTEM.VAL(LONGINT, a DIV 10000H))
+		END;
+		
+		InstallAPICHandlers
+	END Initialize;
+	
+	(* Start handling interrupts, every processor calls this once during initialization *)
+	PROCEDURE Start*;
+	BEGIN
+		LoadIDT(SYSTEM.ADR(idt[0]), SIZE(IDT)-1);
+		SYSTEM.STI
+	END Start;
+		
+	PROCEDURE SwitchToUserLevel*;
+	CONST 
+		UserStackSegmentSelector = Memory.UserStackSegmentSelector;
+		UserCodeSegmentSelector = Memory.UserCodeSegmentSelector;
+	CODE {SYSTEM.i386}
+		PUSH UserStackSegmentSelector ; SS3
+		PUSH ESP	; ESP3
+		PUSHFD	; EFLAGS3
+		PUSH UserCodeSegmentSelector ; CS3
+		CALL L1 ; PUSH EIP3
+	L1:
+		ADD DWORD [ESP], 5 ; adjust EIP3 to L2 (L2-L1 = 5)
+		IRETD
+	L2:
+	END SwitchToUserLevel;
+			
+BEGIN
+	Processors.InitializeLock(lock);
+	Initialize;
+	Start;
+	SwitchToUserLevel;
+	EnableTimer;
+	InitializeAPIC
+END Interrupts.
+

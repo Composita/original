@@ -1,0 +1,508 @@
+MODULE ComKeyboard; (** Component System, PC Keyboard Driver, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Concurrency, Interrupts, Memory, Processors;
+
+	(** Keyboard driver partly based on the Native Oberon version *)
+	
+	TYPE
+		KeySymbol* = LONGINT;
+	
+	CONST
+		(** KeySymbol values *)
+		NoSymbol* = 0; ScrollLock* = 1; NumLock* = 2; CapsLock* = 3; GreyEscape* = 4;
+		LeftAlt* = 5; RightAlt* = 6; LeftCtrl* = 7; RightCtrl* = 8; 
+		LeftShift* = 9; RightShift* = 10; LeftMeta* = 11; RightMeta* = 12;
+		Menu* = 13; Space* = 14; BackSpace* = 15; TabSpace* = 16; Return* = 17; Escape* = 18;
+		Insert* = 19; Delete* = 20; Home* = 21; End* = 22; 
+		PageUp* = 23; PageDown* = 24; Left* = 25; Up* = 26; Right* = 27; Down* = 28;
+		F1* = 29; F2* = 30; F3* = 31; F4* = 32; F5* = 33; F6* = 34; F7* = 35; F8* = 36; F9* = 37; 
+		F10* = 38; F11* = 39; F12* = 40;
+	
+	CONST
+		ScrollLockLed = 0; NumLockLed = 1; CapsLockLed = 2;
+	
+	CONST
+		(* values for ledState *)
+		Resetting = 0; SendingLeds = 1; SetTypematic = 2;
+	VAR
+		ledState: SET;
+		lastPort: LONGINT; lastValue: CHAR;
+	
+	TYPE
+		Key* = RECORD
+			char*: CHAR; (* ascii character *)
+			special*: KeySymbol
+		END;
+	
+		Listener* = PROCEDURE {DELEGATE} (flags: SET; k: Key);
+		
+	CONST
+		MaxListeners = 4;
+	
+	TYPE
+		ListenerList = ARRAY MaxListeners OF Listener;
+	
+	VAR
+		lock: Processors.SpinLock;
+		flags: SET;
+		listeners: ListenerList;
+					
+	PROCEDURE ToggleFlag(f: LONGINT);
+	BEGIN IF f IN flags THEN EXCL(flags, f) ELSE INCL(flags, f) END
+	END ToggleFlag;
+	
+	PROCEDURE AddListener*(l: Listener);
+	VAR i: LONGINT;
+	BEGIN
+		Processors.AcquireLock(lock);
+		i := 0; WHILE (i < MaxListeners) & (listeners[i] # NIL) DO INC(i) END;
+		ASSERT(i < MaxListeners);
+		listeners[i] := l;
+		Processors.ReleaseLock(lock)
+	END AddListener;
+		
+	PROCEDURE RemoveListener*(l: Listener);
+	VAR i: LONGINT;
+	BEGIN
+		Processors.AcquireLock(lock);
+		i := 0; WHILE (i < MaxListeners) & (listeners[i] # l) DO INC(i) END;
+		listeners[i] := NIL;
+		Processors.ReleaseLock(lock)
+	END RemoveListener;
+			
+	PROCEDURE KeyPressed(key: Key);
+	VAR copy: ListenerList; i: LONGINT; 
+	BEGIN
+		(* copy listeners to avoid deadlock if some listener handler generates a trap *)
+		Processors.AcquireLock(lock);
+		FOR i := 0 TO MaxListeners-1 DO copy[i] := listeners[i] END;
+		Processors.ReleaseLock(lock);
+		FOR i := 0 TO MaxListeners-1 DO
+			IF listeners[i] # NIL THEN copy[i](flags, key) END
+		END
+	END KeyPressed;
+			
+	PROCEDURE KeyboardInterruptHandler(VAR state: Interrupts.InterruptState);
+	VAR c: CHAR; param: Memory.Address;
+	BEGIN
+		ReadKey(c); param := SYSTEM.VAL(Memory.Address, ORD(c));
+		Concurrency.NewProcess(Concurrency.SystemStackSize, KeyboardInput, param, TRUE)
+	END KeyboardInterruptHandler;
+	
+	PROCEDURE KeyboardInput(param: Memory.Address);
+	VAR code: CHAR; key: Key;
+	BEGIN
+		code := CHR(SYSTEM.VAL(LONGINT, param));
+		DecodeKey(code, key);
+		KeyPressed(key)
+	END KeyboardInput;
+	
+	PROCEDURE DecodeKey(code: CHAR; VAR key: Key);
+	VAR oldLeds, newLeds: SET;
+	BEGIN
+		DisableKeyboard;
+		oldLeds := GetLeds();
+		key.special := NoSymbol; key.char := 0X;
+		IF code = 0X THEN (* overrun, ignore *)
+		ELSIF code = 0FAX THEN (* keyboard ack *)
+			IF Resetting IN ledState THEN
+				EXCL(ledState, Resetting); INCL(ledState, SendingLeds);
+				Send(060H, 0EDX)	(* set keyboard LEDs *)
+			ELSIF SendingLeds IN ledState THEN
+				Send(060H, SYSTEM.VAL(CHAR, oldLeds));
+				EXCL(ledState, SendingLeds)
+			ELSIF SetTypematic IN ledState THEN
+				EXCL(ledState, SetTypematic); INCL(ledState, Resetting);
+				Send(060H, 020X) (* 30Hz, 500 ms *)
+			END
+		ELSIF code = 0FEX THEN (* keyboard resend *)
+			Send(lastPort, lastValue)
+		ELSIF code = 038X THEN (* Alt make *)
+			IF ~(GreyEscape IN flags) THEN
+				INCL(flags, LeftAlt); key.special := LeftAlt
+			ELSE
+				INCL(flags, RightAlt); key.special := RightAlt
+			END
+		ELSIF code = 01DX THEN (* Ctrl make *)
+			INCL(flags, LeftCtrl); key.special := LeftCtrl
+		ELSIF code = 02AX THEN (* LeftShift make *)
+			IF ~(GreyEscape IN flags) THEN
+				INCL(flags, LeftShift); key.special := LeftShift
+			END
+		ELSIF code = 036X THEN (* RightShift make *)
+			IF ~(GreyEscape IN flags) THEN
+				INCL(flags, RightShift); key.special := RightShift
+			END
+		ELSIF code = 05BX THEN (* LeftMeta make *)
+			INCL(flags, LeftMeta); key.special := LeftMeta
+		ELSIF code = 05CX THEN (* RightMeta make *)
+			INCL(flags, RightMeta); key.special := RightMeta
+		ELSIF code = 03AX THEN (* CapsLock make *)
+			ToggleFlag(CapsLock); key.special := CapsLock
+		ELSIF code = 046X THEN (* ScrollLock make *)
+			ToggleFlag(ScrollLock); key.special := ScrollLock
+		ELSIF code = 045X THEN (* NumLock make *)
+			ToggleFlag(NumLock); key.special := NumLock
+		ELSIF code = 0B8X THEN (* Alt break *)
+			IF ~(GreyEscape IN flags) THEN
+				EXCL(flags, LeftAlt); key.special := LeftAlt
+			ELSE
+				EXCL(flags, RightAlt); key.special := RightAlt
+			END
+		ELSIF code = 09DX THEN (* Ctrl break *)
+			EXCL(flags, LeftCtrl); key.special := LeftCtrl
+		ELSIF code = 0AAX THEN (* LeftShift break *)
+			IF ~(GreyEscape IN flags) THEN
+				EXCL(flags, LeftShift); key.special := LeftShift
+			END
+		ELSIF code = 0B6X THEN (* RightShift break *)
+			IF ~(GreyEscape IN flags) THEN
+				EXCL(flags, RightShift); key.special := RightShift
+			END
+		ELSIF code = 0DBX THEN (* LeftMeta break *)
+			EXCL(flags, LeftMeta); key.special := LeftMeta
+		ELSIF code = 0DCX THEN (* RightMeta break *)
+			EXCL(flags, RightMeta); key.special := RightMeta
+		ELSIF ~(GreyEscape IN flags) THEN
+			(* key pads *)
+			IF code = 05DX THEN key.special := Menu
+			ELSIF code = 00EX THEN key.special := BackSpace
+			ELSIF code = 00FX THEN key.special := TabSpace
+			ELSIF code = 01CX THEN key.special := Return
+			ELSIF code = 001X THEN key.special := Escape
+			
+			ELSIF code = 0CBX THEN key.special := Left
+			ELSIF code = 0CDX THEN key.special := Right
+			ELSIF code = 0C8X THEN key.special := Up
+			ELSIF code = 0D0X THEN key.special := Down
+			ELSIF code = 0D2X THEN key.special := Insert
+			ELSIF code = 0D3X THEN key.special := Delete
+			ELSIF code = 0C9X THEN key.special := PageUp
+			ELSIF code = 0D1X THEN key.special := PageDown
+			ELSIF code = 0C7X THEN key.special := Home
+			ELSIF code = 0CFX THEN key.special := End
+						
+			ELSIF code = 0A4X THEN key.special := F1
+			ELSIF code = 0A5X THEN key.special := F2
+			ELSIF code = 03DX THEN key.special := F3
+			ELSIF code = 0A7X THEN key.special := F4
+			ELSIF code = 0F5X THEN key.special := F5
+			ELSIF code = 0F6X THEN key.special := F6
+			ELSIF code = 0F7X THEN key.special := F7
+			ELSIF code = 0F8X THEN key.special := F8
+			ELSIF code = 0F9X THEN key.special := F9
+			ELSIF code = 0FAX THEN key.special := F10
+			ELSIF code = 0FBX THEN key.special := F11
+			ELSIF code = 0FCX THEN key.special := F12
+			END
+		ELSE (* grey keys *)
+			IF code = 04BX THEN key.special := Left
+			ELSIF code = 04DX THEN key.special := Right
+			ELSIF code = 048X THEN key.special := Up
+			ELSIF code = 050X THEN key.special := Down
+			ELSIF code = 052X THEN key.special := Insert
+			ELSIF code = 053X THEN key.special := Delete
+			ELSIF code = 049X THEN key.special := PageUp
+			ELSIF code = 051X THEN key.special := PageDown
+			ELSIF code = 047X THEN key.special := Home
+			ELSIF code = 04FX THEN key.special := End
+			
+			ELSIF code = 09CX THEN key.special := Return
+			END
+		END;
+		
+		IF ~(GreyEscape IN flags) THEN
+			key.char := DecodeAscii(code); (* ascii *)
+		END;
+		
+		IF NumLock IN flags THEN
+			IF GreyEscape IN flags THEN
+				IF code = 0B5X THEN key.char := "/" END
+			ELSE
+				IF code = 04FX THEN key.char := "1"
+				ELSIF code = 050X THEN key.char := "2"
+				ELSIF code = 051X THEN key.char := "3"
+				ELSIF code = 04BX THEN key.char := "4"
+				ELSIF code = 04CX THEN key.char := "5"
+				ELSIF code = 04DX THEN key.char := "6"
+				ELSIF code = 047X THEN key.char := "7"
+				ELSIF code = 048X THEN key.char := "8"
+				ELSIF code = 049X THEN key.char := "9"
+				ELSIF code = 052X THEN key.char := "0"
+				ELSIF code = 053X THEN key.char := "."
+				ELSIF code = 04AX THEN key.char := "-"
+				ELSIF code = 04EX THEN key.char := "+"
+				ELSIF code = 0B5X THEN key.char := "/"
+				ELSIF code = 037X THEN key.char := "*"
+				END
+			END
+		END;
+
+		IF key.char # 0X THEN key.special := NoSymbol END;
+		IF code = 0E0X THEN INCL(flags, GreyEscape) 
+		ELSE EXCL(flags, GreyEscape)
+		END;
+		newLeds := GetLeds();
+		IF oldLeds # newLeds THEN 
+			INCL(ledState, SendingLeds);
+			Send(060H, 0EDX) (* set keyboard LEDs *)
+		END;
+		EnableKeyboard
+	END DecodeKey;
+	
+	PROCEDURE DecodeAscii(code: CHAR): CHAR;
+	BEGIN RETURN DecodeSwissGermanAscii(code)
+	END DecodeAscii;
+	
+	PROCEDURE DecodeSwissGermanAscii(code: CHAR): CHAR;
+	VAR shift, caps, alt, altgr: BOOLEAN; x: CHAR;
+	BEGIN
+		shift := flags * {LeftShift, RightShift} # {};
+		caps := CapsLock IN flags;
+		alt := LeftAlt IN flags; altgr := RightAlt IN flags;
+		x := 0X;
+		IF code = 01EX THEN x := "a"
+		ELSIF code = 030X THEN x := "b"
+		ELSIF code = 02EX THEN x := "c"
+		ELSIF code = 020X THEN x := "d"
+		ELSIF code = 012X THEN x := "e"
+		ELSIF code = 021X THEN x := "f"
+		ELSIF code = 022X THEN x := "g"
+		ELSIF code = 023X THEN x := "h"
+		ELSIF code = 017X THEN x := "i"
+		ELSIF code = 024X THEN x := "j"
+		ELSIF code = 025X THEN x := "k"
+		ELSIF code = 026X THEN x := "l"
+		ELSIF code = 032X THEN x := "m"
+		ELSIF code = 031X THEN x := "n"
+		ELSIF code = 018X THEN x := "o"
+		ELSIF code = 019X THEN x := "p"
+		ELSIF code = 010X THEN x := "q"
+		ELSIF code = 013X THEN x := "r"
+		ELSIF code = 01FX THEN x := "s"
+		ELSIF code = 014X THEN x := "t"
+		ELSIF code = 016X THEN x := "u"
+		ELSIF code = 02FX THEN x := "v"
+		ELSIF code = 011X THEN x := "w"
+		ELSIF code = 02DX THEN x := "x"
+		ELSIF code = 02CX THEN x := "y"
+		ELSIF code = 015X THEN x := "z"
+		ELSIF code = 00BX THEN x := "0"
+		ELSIF code = 002X THEN x := "1"
+		ELSIF code = 003X THEN x := "2"
+		ELSIF code = 004X THEN x := "3"
+		ELSIF code = 005X THEN x := "4"
+		ELSIF code = 006X THEN x := "5"
+		ELSIF code = 007X THEN x := "6"
+		ELSIF code = 008X THEN x := "7"
+		ELSIF code = 009X THEN x := "8"
+		ELSIF code = 00AX THEN x := "9"
+		ELSIF code = 028X THEN x := 83X (* "ä" *)
+		ELSIF code = 033X THEN x := ","
+		ELSIF code = 00CX THEN x := "'"
+		ELSIF code = 034X THEN x := "."
+		ELSIF code = 035X THEN x := "-"
+		ELSIF code = 027X THEN x := 84X (* "ö*)
+		ELSIF code = 00DX THEN x := "^"
+		ELSIF code = 01AX THEN x := 85X (* "ü" *)
+		ELSIF code = 02BX THEN x := "$"
+		ELSIF code = 01BX THEN x := 0X (* shift !, altgr ] *)
+		ELSIF code = 029X THEN x := "<"
+		ELSIF code = 039X THEN x := " "
+		END;
+		IF (~shift & caps) OR (shift & ~caps) THEN
+			IF (x >= "a") & (x <= "z") THEN x := CAP(x) END
+		END;
+		IF shift THEN
+			IF x = "0" THEN x := "="
+			ELSIF x = "1" THEN x := "+"
+			ELSIF x = "2" THEN x := 22X
+			ELSIF x = "3" THEN x := "*"
+			ELSIF x = "4" THEN x := 93X (* "ç" *)
+			ELSIF x = "5" THEN x := "%"
+			ELSIF x = "6" THEN x := "&"
+			ELSIF x = "7" THEN x := "/"
+			ELSIF x = "8" THEN x := "("
+			ELSIF x = "9" THEN x := ")"
+			ELSIF x = 83X THEN x := 8BX (* "à" *)
+			ELSIF x = "," THEN x := ";"
+			ELSIF x = "'" THEN x := "?"
+			ELSIF x = "." THEN x := ":"
+			ELSIF x = "-" THEN x := "_"
+			ELSIF x = 84X THEN x := 90X (* "é" *)
+			ELSIF x = "^" THEN x := "`"
+			ELSIF x = 85X THEN x := 8CX (* "è" *)
+			ELSIF x = "$" THEN x := 0X (* pound symbol not supported *)
+			ELSIF code = 01BX THEN x := "!"
+			ELSIF x = "<" THEN x := ">"
+			END
+		END;
+		IF altgr THEN
+			IF x = "1" THEN x := "|"
+			ELSIF x = "2" THEN x := "@"
+			ELSIF x = "3" THEN x := "#"
+			ELSIF x = "^" THEN x := "~"
+			ELSIF x = 85X THEN x := "["
+			ELSIF code = 01BX THEN x := "]"
+			ELSIF x = 83X THEN x := "{"
+			ELSIF x = "$" THEN x := "}"
+			ELSIF x = "<" THEN x := "\"
+			END
+		END;
+		RETURN x
+	END DecodeSwissGermanAscii;
+
+	PROCEDURE DecodeUSAscii(code: CHAR): CHAR;
+	VAR shift, caps, alt, altgr: BOOLEAN; x: CHAR;
+	BEGIN
+		shift := flags * {LeftShift, RightShift} # {};
+		caps := CapsLock IN flags;
+		alt := LeftAlt IN flags; altgr := RightAlt IN flags;
+		x := 0X;
+		IF code = 01EX THEN x := "a"
+		ELSIF code = 030X THEN x := "b"
+		ELSIF code = 02EX THEN x := "c"
+		ELSIF code = 020X THEN x := "d"
+		ELSIF code = 012X THEN x := "e"
+		ELSIF code = 021X THEN x := "f"
+		ELSIF code = 022X THEN x := "g"
+		ELSIF code = 023X THEN x := "h"
+		ELSIF code = 017X THEN x := "i"
+		ELSIF code = 024X THEN x := "j"
+		ELSIF code = 025X THEN x := "k"
+		ELSIF code = 026X THEN x := "l"
+		ELSIF code = 032X THEN x := "m"
+		ELSIF code = 031X THEN x := "n"
+		ELSIF code = 018X THEN x := "o"
+		ELSIF code = 019X THEN x := "p"
+		ELSIF code = 010X THEN x := "q"
+		ELSIF code = 013X THEN x := "r"
+		ELSIF code = 01FX THEN x := "s"
+		ELSIF code = 014X THEN x := "t"
+		ELSIF code = 016X THEN x := "u"
+		ELSIF code = 02FX THEN x := "v"
+		ELSIF code = 011X THEN x := "w"
+		ELSIF code = 02DX THEN x := "x"
+		ELSIF code = 015X THEN x := "y"
+		ELSIF code = 02CX THEN x := "z"
+		ELSIF code = 00BX THEN x := "0"
+		ELSIF code = 002X THEN x := "1"
+		ELSIF code = 003X THEN x := "2"
+		ELSIF code = 004X THEN x := "3"
+		ELSIF code = 005X THEN x := "4"
+		ELSIF code = 006X THEN x := "5"
+		ELSIF code = 007X THEN x := "6"
+		ELSIF code = 008X THEN x := "7"
+		ELSIF code = 009X THEN x := "8"
+		ELSIF code = 00AX THEN x := "9"
+		ELSIF code = 028X THEN x := "'"
+		ELSIF code = 033X THEN x := ","
+		ELSIF code = 00CX THEN x := "-"
+		ELSIF code = 034X THEN x := "."
+		ELSIF code = 035X THEN x := "/"
+		ELSIF code = 027X THEN x := ";"
+		ELSIF code = 00DX THEN x := "="
+		ELSIF code = 01AX THEN x := "["
+		ELSIF code = 02BX THEN x := "\"
+		ELSIF code = 01BX THEN x := "]"
+		ELSIF code = 029X THEN x := "`"
+		ELSIF code = 039X THEN x := " "
+		END;
+		IF (~shift & caps) OR (shift & ~caps) THEN
+			IF (x >= "a") & (x <= "z") THEN x := CAP(x) END
+		END;
+		IF shift THEN
+			IF x = "0" THEN x := ")"
+			ELSIF x = "1" THEN x := "!"
+			ELSIF x = "2" THEN x := "@"
+			ELSIF x = "3" THEN x := "#"
+			ELSIF x = "4" THEN x := "$"
+			ELSIF x = "5" THEN x := "%"
+			ELSIF x = "6" THEN x := "^"
+			ELSIF x = "7" THEN x := "&"
+			ELSIF x = "8" THEN x := "*"
+			ELSIF x = "9" THEN x := "("
+			ELSIF x = "'" THEN x := 22X
+			ELSIF x = "," THEN x := "<"
+			ELSIF x = "-" THEN x := "_"
+			ELSIF x = "." THEN x := ">"
+			ELSIF x = "/" THEN x := "?"
+			ELSIF x = ";" THEN x := ":"
+			ELSIF x = "=" THEN x := "+"
+			ELSIF x = "[" THEN x := "{"
+			ELSIF x = "\" THEN x := "|" 
+			ELSIF x = "]" THEN x := "}"
+			ELSIF x = "`" THEN x := "~"
+			END
+		END;
+		RETURN x
+	END DecodeUSAscii;
+		
+	PROCEDURE ReadKey(VAR c: CHAR);
+	VAR m: SET;
+	BEGIN
+		SYSTEM.PORTIN(060H, c); (* scan code *)
+		SYSTEM.PORTIN(061H, SYSTEM.VAL(CHAR, m));
+		INCL(m, 7); SYSTEM.PORTOUT(061H, SYSTEM.VAL(CHAR, m));
+		EXCL(m, 7); SYSTEM.PORTOUT(061H, SYSTEM.VAL(CHAR, m)) (* ack *)
+	END ReadKey;
+	
+	PROCEDURE GetLeds(): SET;
+	VAR leds, flags: SET; 
+	BEGIN
+		leds := {};
+		IF NumLock IN flags THEN INCL(leds, NumLockLed) END;
+		IF ScrollLock IN flags THEN INCL(leds, ScrollLockLed) END;
+		IF CapsLock IN flags THEN INCL(leds, CapsLockLed) END;
+		RETURN leds
+	END GetLeds;
+				
+	PROCEDURE DisableKeyboard;
+	BEGIN Send(064H, 0ADX); Wait
+	END DisableKeyboard;
+	
+	PROCEDURE EnableKeyboard;
+	BEGIN Send(064H, 0AEX)
+	END EnableKeyboard;
+	
+	PROCEDURE Send(port: LONGINT; value: CHAR);
+	BEGIN 
+		Wait; SYSTEM.PORTOUT(port, value);
+		lastPort := port; lastValue := value
+	END Send;
+	
+	PROCEDURE Wait;
+	VAR ticks: CARDINAL; s: SET;
+	BEGIN
+		ticks := Interrupts.timerTicks;
+		REPEAT
+			SYSTEM.PORTIN(064H, SYSTEM.VAL(CHAR, s))
+		UNTIL ~(1 IN s) OR (Interrupts.timerTicks > ticks + 1)
+	END Wait;
+	
+	PROCEDURE ClearKeyboardBuffer;
+	VAR i: LONGINT; s: SET; c: CHAR;
+	BEGIN
+		i := 0;
+		REPEAT
+			SYSTEM.PORTIN(64H, SYSTEM.VAL(CHAR, s));
+			IF 0 IN s THEN ReadKey(c) END;
+			INC(i)
+		UNTIL ~(0 IN s) OR (i = 8);
+	END ClearKeyboardBuffer;
+	
+	PROCEDURE Initialize;
+	CONST KeyboardIRQ = Interrupts.IRQ1;
+	BEGIN
+		Processors.InitializeLock(lock);
+		flags := {};
+		ClearKeyboardBuffer;
+		ledState := {SetTypematic};
+		Interrupts.InstallInterruptHandler(KeyboardIRQ, KeyboardInterruptHandler);
+		Interrupts.EnableIRQ(KeyboardIRQ);
+		Send(060H, 0F3X) (* cause ack from keyboard *)
+	END Initialize;
+
+BEGIN
+	Initialize
+END ComKeyboard.
+

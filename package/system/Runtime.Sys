@@ -1,0 +1,3470 @@
+MODULE ComRuntime; (* Component Runtime System, 2007 by Luc Blaeser *)
+	IMPORT 
+		SYSTEM, Collections := ComCollections, FileSystem := ComFileSystem, Basic := ComBasic, 
+		Output, Concurrency, Interrupts, Heap, Memory, Processors;
+	
+	(* 
+		Lock order:
+		1. communication buffer lock (nesting forbidden)
+		2. component locks (nesting only in the direction towards hierarchically surrounding components
+		3. module locks (nesting according to modular hierarchy)
+	*)
+		
+	CONST
+		Profiling = FALSE;
+		
+		LogFileName = "Log.txt";
+		
+		PreemptionIntervall = 1; (* ms *)
+		StackExtensionThreshold = 1024;
+		AwaitForwardTraversion = FALSE;
+	
+		NilValue* = Memory.Nil;
+		TrueValue* = 1; 
+		FalseValue* = 0;
+		
+		(* see memory layout specification *)
+		
+		ProcessHeaderSize = 11*4; 
+		ProcessBackupPCOffset = 0*4;
+		ProcessBackupESPOffset = 1*4;
+		ProcessBackupEBPOffset = 2*4;
+		ProcessStackLimitOffset = 3*4;
+		ProcessPrevProcessOffset = 4*4; 
+		ProcessNextProcessOffset = 5*4;
+		ProcessHeaderCompOffset = 6*4;
+		ProcessAwaitLockOffset = 7*4;
+		ProcessAwaitMessageOffset = 7*4+1;
+		ProcessAwaitEBPOffset = 8*4;
+		ProcessAwaitPCOffset = 9*4;
+		ProcessNextTimeOffset = 10*4;
+
+		WaitForAnyTime = -1; (* possible value for next time *)
+
+		ProcessTailSize = 4*4;
+		ProcessTailNil1Offset = 0*4;
+		ProcessTailNil2Offset = 1*4;
+		ProcessTailSelfProcessOffset = 2*4;
+		ProcessTailComponentOffset = 3*4;
+		ProcessTailCommBufferOffset = 4*4;
+		
+		ProcessReservedSize = ProcessHeaderSize + ProcessTailSize;
+			
+		ProcessListSize = 2*4;
+		ProcessListFirstOffset = 0;
+		ProcessListLastOffset = 4;
+		
+		ComponentHeaderSize = 20*4;
+		ComponentTemplateOffset = 0*4;
+		ComponentSpinLockOffset = 1*4;
+		ComponentSuperComOffset = 2*4;
+		ComponentLockListOffset = 3*4;
+		ComponentAwaitListOffset = 5*4;
+		ComponentPassiveUnsortedOffset = 7*4;
+		ComponentPassiveSortedOffset = 9*4;
+		ComponentExternalWaitOffset = 11*4;
+		ComponentLifeStateOffset = 13*4;
+		ComponentTerminatedOffset = 13*4+1;
+		ComponentSynchronizedOffset = 13*4+2;
+		ComponentLocalProcCounterOffset = 14*4;
+		ComponentLocalWaitCounterOffset = 15*4;
+		ComponentSyncProcCounterOffset = 16*4;
+		ComponentPassiveCounterOffset = 17*4;
+		ComponentLockCounterOffset = 18*4;
+		ComponentVirtualTimeOffset = 19*4;
+
+		InterfaceConnectionSize = 5*4;
+		InterfaceConnFlagOffset = 0*4;
+		InterfaceConnReferenceOffset = 1*4; (* target connection, implementation code, interface collection *)
+		InterfaceConnComponentOffset = 2*4;
+		InterfaceConnCounterOffset = 3*4;
+		InterfaceConnCommCounterOffset = 4*4;
+
+	CONST
+		ConnectionFlagNone = 0;
+		ConnectionFlagRedirected = 1;
+		ConnectionFlagImplemented = 2;
+		ConnectionFlagCollection = 3;
+
+	CONST
+		CommunicationBufferHeaderSize = 8*4; 
+		CommunicationInterfaceOffset = 0*4;
+		CommunicationSpinLockOffset = 1*4;
+		CommProtocolStateOffset = 2*4;
+		CommWaitingProcessOffset = 3*4;
+		CommSourceConnectionOffset = 4*4;
+		CommunicationFirstOffset = 5*4;
+		CommunicationLastOffset = 6*4;
+		CommunicationEntrySizeOffset = 7*4;
+		
+		CommEntryHeaderSize = 2*4; (* sender, message *)
+		CommEntrySenderOffset = 0*4;
+		CommEntryMessageOffset = 1*4;
+		CommEntryParameterOffset = 2*4;
+		
+		CommunicationBufferCapacity = 4;
+		
+		NoMessage = -1; 
+		FinishMessage = -2; 
+		
+		ExtraRows = 3;
+		ErrorProtocolRow = 0;
+		FinishProtocolRow = 1;
+		StartProtocolRow = 2;
+		(* other rows for states, indexed by last messageId + 2 *)
+		
+		ExtraColumns = 1;
+		FinishProtocolColumn = 0;
+		(* other column for transitions, indexed by sent messageId + 1 *)
+
+	CONST
+		ArrayHeaderSize = 8; (* nofDims *)
+		ArrayNofDimsOffset = 0;
+		ArrayElemSizeOffset = 4;
+
+	CONST
+		(* shortint *)
+		LifeStateCreated = 0;
+		LifeStateInitialized = 1;
+		LifeStateInactive = 2;
+		LifeStateFinalized = 3;
+		
+	CONST
+		NoLock = 0;
+		ExclusiveLock = -1;
+		(* positive value counts shared locks *)
+		
+		CharacterTypeCode* = Collections.CharacterTypeCode;
+		BooleanTypeCode* = Collections.BooleanTypeCode;
+		IntegerTypeCode* = Collections.IntegerTypeCode;
+		RealTypeCode* = Collections.RealTypeCode;
+		TextTypeCode* = Collections.TextTypeCode;
+		ComponentTypeCode* = Collections.ComponentTypeCode;
+		
+		CONST
+		SystemTemplateName* = "@SYSTEM";
+		SystemComponentName* = "SYSTEM";
+		SystemTimeInterfaceName* = "SystemTime";
+		FileSystemInterfaceName* = "FileSystem";
+		GraphicViewInterfaceName* = "GraphicView";
+									
+	TYPE
+		Address* = Memory.Address;
+		
+		ProtocolStateMatrix* = Basic.RawSection;
+		
+		TypeList* = Basic.LongIntList;
+		
+		MessageDeclaration* = OBJECT
+			VAR 
+				name-: Basic.String;
+				parameterTypes-: TypeList;
+				
+			PROCEDURE &InitMessageDeclaration*(str: ARRAY OF CHAR);
+			BEGIN name := Basic.NewString(str); NEW(parameterTypes); parameterTypes.multipleAllowed := TRUE
+			END InitMessageDeclaration;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(name); parameterTypes.Free; DELETE(parameterTypes)
+			END Free;
+		END MessageDeclaration;
+		
+		MessageDeclarationList* = OBJECT(Basic.List)
+			PROCEDURE Add*(x: PTR);
+			BEGIN ASSERT(x IS MessageDeclaration); Add^(x)
+			END Add;
+			
+			PROCEDURE GetMessageDeclaration*(index: LONGINT): MessageDeclaration;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(MessageDeclaration)
+			END GetMessageDeclaration;
+			
+			PROCEDURE FindMessageDeclaration*(name: ARRAY OF CHAR): MessageDeclaration;
+			VAR i: LONGINT; x: MessageDeclaration;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetMessageDeclaration(i);
+					IF x.name^ = name THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindMessageDeclaration;
+			
+			PROCEDURE IndexOfMessageDeclaration(name: ARRAY OF CHAR): LONGINT;
+			VAR i: LONGINT; x: MessageDeclaration;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetMessageDeclaration(i);
+					IF x.name^ = name THEN RETURN i END
+				END;
+				HALT(111)
+			END IndexOfMessageDeclaration;
+			
+			PROCEDURE Free*;
+			VAR i: LONGINT; x: MessageDeclaration;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetMessageDeclaration(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END MessageDeclarationList;
+		
+		InterfaceSpecification* = OBJECT
+			VAR
+				name-: Basic.String;
+				code-: LONGINT;
+				messageDeclarations-: MessageDeclarationList;
+				protocolStateMatrix*: ProtocolStateMatrix;
+				
+			PROCEDURE &InitInterfaceSpecification*(id: ARRAY OF CHAR; messageList: MessageDeclarationList; encode: LONGINT);
+			BEGIN name := Basic.NewString(id); messageDeclarations := messageList; code := encode
+			END InitInterfaceSpecification;
+			
+			PROCEDURE Free*;
+			BEGIN 
+				DELETE(name); 
+				IF messageDeclarations # NIL THEN messageDeclarations.Free; DELETE(messageDeclarations) END;
+				IF protocolStateMatrix # NIL THEN DELETE(protocolStateMatrix) END
+			END Free;
+			
+			PROCEDURE Equal*(x: InterfaceSpecification): BOOLEAN;
+			BEGIN RETURN (x # NIL) & (x.name^ = name^) & (x.code = code)
+			END Equal;
+		END InterfaceSpecification;
+		
+		InterfaceSpecificationList* = OBJECT(Basic.List)
+			PROCEDURE Add*(x: PTR);
+			BEGIN ASSERT(x IS InterfaceSpecification); Add^(x)
+			END Add;
+			
+			PROCEDURE GetInterfaceSpecification*(index: LONGINT): InterfaceSpecification;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(InterfaceSpecification)
+			END GetInterfaceSpecification;
+			
+			PROCEDURE FindInterfaceSpecification*(name: ARRAY OF CHAR): InterfaceSpecification;
+			VAR i: LONGINT; x: InterfaceSpecification;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetInterfaceSpecification(i);
+					IF x.name^ = name THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindInterfaceSpecification;
+			
+			PROCEDURE Free*;
+			VAR i: LONGINT; x: InterfaceSpecification;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetInterfaceSpecification(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END InterfaceSpecificationList;
+		
+		ComponentTemplate* = OBJECT
+			VAR 
+				name-: Basic.String;
+				offeredInterfaces-, requiredInterfaces-: InterfaceDeclarationList;
+				size: LONGINT;
+				initializerCodeAdr: Address;
+				finalizerCodeAdr: Address;
+				
+			PROCEDURE &InitComponentTemplate*(id: ARRAY OF CHAR; offered, required: InterfaceDeclarationList; 
+				blockSize: LONGINT; initAdr, finAdr: Address);
+			BEGIN 
+				name := Basic.NewString(id); 
+				offeredInterfaces := offered; requiredInterfaces := required;
+				size := blockSize; 
+				initializerCodeAdr := initAdr; 
+				finalizerCodeAdr := finAdr
+			END InitComponentTemplate;
+			
+			PROCEDURE Free*;
+			BEGIN
+				DELETE(name); 
+				offeredInterfaces.Free; DELETE(offeredInterfaces);
+				requiredInterfaces.Free; DELETE(requiredInterfaces)
+			END Free;
+		END ComponentTemplate;
+	
+		ComponentTemplateList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS ComponentTemplate); Add^(x)
+			END Add;
+			
+			PROCEDURE GetComponentTemplate(index: LONGINT): ComponentTemplate;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(ComponentTemplate)
+			END GetComponentTemplate;
+			
+			PROCEDURE FindComponentTemplate(name: ARRAY OF CHAR): ComponentTemplate;
+			VAR i: LONGINT; x: ComponentTemplate;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetComponentTemplate(i);
+					IF x.name^ = name THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindComponentTemplate;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; x: ComponentTemplate;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetComponentTemplate(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END ComponentTemplateList;
+		
+		InterfaceDeclaration* = OBJECT
+			VAR
+				name-: Basic.String;
+				minNumber-, maxNumber-: LONGINT;
+				
+			PROCEDURE &InitInterfaceDeclaration*(id: ARRAY OF CHAR; min, max: LONGINT);
+			BEGIN name := Basic.NewString(id); minNumber := min; maxNumber := max
+			END InitInterfaceDeclaration;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(name)
+			END Free;
+			
+			PROCEDURE Equal*(x: InterfaceDeclaration): BOOLEAN;
+			BEGIN RETURN (x # NIL) & (x.name^ = name^) & (x.minNumber = minNumber) & (x.maxNumber = maxNumber)
+			END Equal;
+		END InterfaceDeclaration;
+		
+		InterfaceDeclarationList* = OBJECT(Basic.List)
+			PROCEDURE Add*(x: PTR);
+			BEGIN ASSERT(x IS InterfaceDeclaration); Add^(x)
+			END Add;
+			
+			PROCEDURE GetInterfaceDeclaration*(index: LONGINT): InterfaceDeclaration;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(InterfaceDeclaration)
+			END GetInterfaceDeclaration;
+			
+			PROCEDURE Equal*(x: InterfaceDeclarationList): BOOLEAN;
+			VAR i: LONGINT; a, b: InterfaceDeclaration;
+			BEGIN
+				IF (x # NIL) & (x.Length() = Length()) THEN
+					FOR i := 0 TO Length()-1 DO
+						a := GetInterfaceDeclaration(i); b := x.GetInterfaceDeclaration(i);
+						IF ~a.Equal(b) THEN RETURN FALSE END
+					END;
+					RETURN TRUE
+				ELSE RETURN FALSE
+				END
+			END Equal;
+			
+			PROCEDURE FindInterfaceDeclaration*(int: InterfaceSpecification): InterfaceDeclaration;
+			VAR i: LONGINT; decl: InterfaceDeclaration;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					decl := GetInterfaceDeclaration(i);
+					IF decl.name^ = int.name^ THEN RETURN decl END
+				END;
+				RETURN NIL
+			END FindInterfaceDeclaration;
+			
+			PROCEDURE Free*;
+			VAR i: LONGINT; decl: InterfaceDeclaration;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					decl := GetInterfaceDeclaration(i); decl.Free
+				END;
+				decl := NIL;
+				Free^
+			END Free;
+		END InterfaceDeclarationList;
+		
+		ConnectionList = OBJECT(Basic.LongIntList)
+			VAR
+				component: Address; 
+				min, max: LONGINT;
+				lock: Processors.SpinLock;
+			
+			PROCEDURE &InitConnectionList(com: Address; minConn, maxConn: LONGINT);
+			BEGIN InitList; component := com; min := minConn; max := maxConn; Processors.InitializeLock(lock)
+			END InitConnectionList;
+			
+			PROCEDURE Lock;
+			BEGIN IF Concurrency.mode # Concurrency.SerialMode THEN Processors.AcquireLock(lock) END
+			END Lock;
+			
+			PROCEDURE Unlock;
+			BEGIN IF Concurrency.mode # Concurrency.SerialMode THEN Processors.ReleaseLock(lock) END
+			END Unlock;
+			
+			PROCEDURE Add(x: LONGINT);
+			BEGIN HALT(98) (* use GetConnection *)
+			END Add;
+			
+			PROCEDURE CreateConnections(toIndex: LONGINT);
+			VAR connAdr: Address;
+			BEGIN
+				IF Concurrency.mode # Concurrency.SerialMode THEN ASSERT(Processors.IsLocked(lock)) END;
+				WHILE Length() <= toIndex DO
+					Heap.New(connAdr, InterfaceConnectionSize); 
+					(* initialize conn *)
+					SYSTEM.PUT8(connAdr + InterfaceConnFlagOffset, ConnectionFlagNone);
+					SYSTEM.PUT32(connAdr + InterfaceConnReferenceOffset, NilValue);
+					SYSTEM.PUT32(connAdr + InterfaceConnComponentOffset, component);
+					SYSTEM.PUT32(connAdr + InterfaceConnCounterOffset, 0);
+					SYSTEM.PUT32(connAdr + InterfaceConnCommCounterOffset, 0);
+					Add^(SYSTEM.VAL(LONGINT, connAdr))
+				END
+			END CreateConnections;
+			
+			PROCEDURE GetConnection(index: LONGINT): Address;
+			VAR val: LONGINT;
+			BEGIN 
+				CreateConnections(index);
+				val := GetItem(index); RETURN SYSTEM.VAL(Address, val)
+			END GetConnection;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; conn: Address;
+			BEGIN
+				Lock;
+				FOR i := 0 TO Length()-1 DO
+					conn := GetConnection(i); ASSERT(conn # NilValue);
+					Heap.Delete(conn)
+				END;
+				Unlock;
+				Free^
+			END Free;
+		END ConnectionList;
+		
+		CommunicationBufferList = OBJECT(Basic.LongIntList)
+			VAR min, max: LONGINT;
+			
+			PROCEDURE &InitCommunicationBufferList(minConn, maxConn: LONGINT);
+			BEGIN InitList; min := minConn; max := maxConn
+			END InitCommunicationBufferList;
+			
+			PROCEDURE Add(x: LONGINT);
+			BEGIN HALT(98) (* use GetCommunication *)
+			END Add;
+									
+			PROCEDURE CreateCommunications(toIndex: LONGINT);
+			VAR adr: Address;
+			BEGIN
+				WHILE Length() <= toIndex DO
+					Heap.New(adr, 4);
+					SYSTEM.PUT32(adr, NilValue);
+					Add^(SYSTEM.VAL(LONGINT, adr))
+				END
+			END CreateCommunications;
+			
+			PROCEDURE GetCommunication(index: LONGINT): Address;
+			VAR val: LONGINT;
+			BEGIN
+				CreateCommunications(index);
+				val := GetItem(index); RETURN SYSTEM.VAL(Address, val)
+			END GetCommunication;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; comm: Address;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					comm := GetCommunication(i); ASSERT(comm # NilValue);
+					Heap.Delete(comm)
+				END;
+				Free^
+			END Free;
+		END CommunicationBufferList;
+		
+		CommunicationSetEntry* = OBJECT
+			VAR
+				instance: Address;
+				bufferIndex: LONGINT;
+				buffer: Address;
+				
+			PROCEDURE &InitCommunicationSetEntry(inst: Address; bufIndex: LONGINT);
+			BEGIN instance := inst; bufferIndex := bufIndex; buffer := NilValue
+			END InitCommunicationSetEntry;
+		END CommunicationSetEntry;
+		
+		CommunicationSet* = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN HALT(98) (* use GetCommBufferAdr *)
+			END Add;
+						
+			PROCEDURE GetEntry(index: LONGINT): CommunicationSetEntry;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(CommunicationSetEntry)
+			END GetEntry;
+			
+			PROCEDURE GetCommBufferAdr(instance: Address; bufferIndex: LONGINT): Address;
+			VAR i: LONGINT; first, entry: CommunicationSetEntry;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					entry := GetEntry(i); 
+					IF (entry.instance = instance) & (entry.bufferIndex = bufferIndex) THEN
+						IF i # 0 THEN (* swap *)
+							first := GetEntry(0); 
+							ReplaceByIndex(0, entry); ReplaceByIndex(i, first)
+						END;
+						RETURN SYSTEM.ADR(entry.buffer)
+					END
+				END;
+				(* try recycle *)
+				FOR i := 0 TO Length()-1 DO
+					entry := GetEntry(i);
+					IF entry.buffer = NilValue THEN
+						entry.instance := instance; entry.bufferIndex := bufferIndex;
+						RETURN SYSTEM.ADR(entry.buffer)
+					END
+				END;
+				NEW(entry, instance, bufferIndex); Add^(entry);
+				RETURN SYSTEM.ADR(entry.buffer)
+			END GetCommBufferAdr;
+		END CommunicationSet;
+		
+		Const* = Basic.RawSection;
+		
+		ConstList = OBJECT(Basic.List)
+		END ConstList;
+		
+		Code* = Basic.RawSection;
+		
+		CodeList = OBJECT(Basic.List)
+		END CodeList;
+		
+		TrapRegion* = OBJECT
+			VAR
+				name: Basic.String;
+				start, end: Address;
+			
+			PROCEDURE &InitTrapRegion*(id: ARRAY OF CHAR; code: Code);
+			BEGIN name := Basic.NewString(id); start := SYSTEM.ADR(code[0]); end := start + LEN(code) - 1
+			END InitTrapRegion;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(name)
+			END Free;
+		END TrapRegion;
+		
+		TrapRegionList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS TrapRegion); Add^(x)
+			END Add;
+			
+			PROCEDURE GetTrapRegion(index: LONGINT): TrapRegion;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(TrapRegion)
+			END GetTrapRegion;
+			
+			PROCEDURE FindTrapRegion(adr: Address): TrapRegion;
+			VAR i: LONGINT; x: TrapRegion;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetTrapRegion(i);
+					IF (adr >= x.start) & (adr <= x.end) THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindTrapRegion;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; x: TrapRegion;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetTrapRegion(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END TrapRegionList;
+									
+	TYPE
+		SystemTask* = OBJECT
+			(* abstract *)
+			PROCEDURE &InitSystemTask*;
+			BEGIN HALT(98) (* abstract *)
+			END InitSystemTask;
+			
+			PROCEDURE Free*;
+			BEGIN HALT(98) (* abstract *)
+			END Free;
+		END SystemTask;
+				
+		CreateComponentTask* = OBJECT(SystemTask)
+			VAR
+				name: Basic.String;
+				template: ComponentTemplate;
+				
+			PROCEDURE &InitCreateComponentTask*(id: ARRAY OF CHAR; templ: ComponentTemplate);
+			BEGIN name := Basic.NewString(id); template := templ
+			END InitCreateComponentTask;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(name); template := NIL
+			END Free;
+		END CreateComponentTask;
+		
+		DeleteComponentTask* = OBJECT(SystemTask)
+			VAR name: Basic.String;
+			
+			PROCEDURE &InitDeleteComponentTask*(id: ARRAY OF CHAR);
+			BEGIN name := Basic.NewString(id)
+			END InitDeleteComponentTask;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(name)
+			END Free;
+		END DeleteComponentTask;
+		
+		ConnectComponentsTask* = OBJECT(SystemTask)
+			VAR 
+				interface: InterfaceSpecification;
+				fromInstance, toInstance: Basic.String;
+				fromIndex: LONGINT;
+			
+			PROCEDURE &InitConnectComponentsTask*(int: InterfaceSpecification; from: ARRAY OF CHAR; 
+				fromIdx: LONGINT; to: ARRAY OF CHAR);
+			BEGIN
+				ASSERT(int # NIL); 
+				interface := int; fromInstance := Basic.NewString(from); fromIndex := fromIdx; 
+				toInstance := Basic.NewString(to)
+			END InitConnectComponentsTask;
+			
+			PROCEDURE Free*;
+			BEGIN interface := NIL; DELETE(fromInstance); DELETE(toInstance)
+			END Free;
+		END ConnectComponentsTask;
+		
+		DisconnectTask*  = OBJECT(SystemTask)
+			VAR
+				interface: InterfaceSpecification;
+				instance: Basic.String;
+				index: LONGINT;
+				
+			PROCEDURE &InitDisconnectTask*(int: InterfaceSpecification; inst: ARRAY OF CHAR; idx: LONGINT);
+			BEGIN
+				ASSERT(int # NIL); 
+				interface := int; instance := Basic.NewString(inst); index := idx
+			END InitDisconnectTask;
+			
+			PROCEDURE Free*;
+			BEGIN interface := NIL; DELETE(instance)
+			END Free;
+		END DisconnectTask;
+		
+		MessageTransmissionTask* = OBJECT(SystemTask)
+			VAR
+				interface: InterfaceSpecification;
+				instance: Basic.String;
+				message: MessageDeclaration;
+				
+			PROCEDURE &InitMessageTransmissionTask*(int: InterfaceSpecification; com: ARRAY OF CHAR;
+				md: MessageDeclaration);
+			BEGIN 
+				ASSERT(int # NIL); ASSERT(md # NIL);
+				interface := int; instance := Basic.NewString(com); message := md
+			END InitMessageTransmissionTask;
+			
+			PROCEDURE Free*;
+			BEGIN interface := NIL; DELETE(instance); message := NIL
+			END Free;
+		END MessageTransmissionTask;
+		
+		SendMessageTask* = OBJECT(MessageTransmissionTask)
+			VAR parameters: ParameterList;
+				
+			PROCEDURE &InitSendMessageTask*(int: InterfaceSpecification; com: ARRAY OF CHAR; 
+				md: MessageDeclaration; pars: ParameterList);
+			BEGIN
+				ASSERT(pars # NIL);
+				InitMessageTransmissionTask(int, com, md); 
+				parameters := pars
+			END InitSendMessageTask;
+			
+			PROCEDURE Free*;
+			BEGIN parameters.Free; DELETE(parameters); Free^
+			END Free
+		END SendMessageTask;
+		
+		ReceiveMessageTask* = OBJECT(MessageTransmissionTask)
+			PROCEDURE &InitReceiveMessageTask*(int: InterfaceSpecification; com: ARRAY OF CHAR; md: MessageDeclaration);
+			BEGIN InitMessageTransmissionTask(int, com, md)
+			END InitReceiveMessageTask;
+			
+			PROCEDURE Free*;
+			BEGIN Free^
+			END Free;
+		END ReceiveMessageTask;
+	
+		Parameter* = OBJECT
+			PROCEDURE &InitParameter*;
+			BEGIN HALT(99) (* abstract *)
+			END InitParameter;
+			
+			PROCEDURE Free*;
+			BEGIN HALT(99) (* abstract *)
+			END Free;
+		END Parameter;
+		
+		CharacterParameter* = OBJECT(Parameter)
+			VAR value: CHAR;
+			
+			PROCEDURE &InitCharacterParameter*(x: CHAR);
+			BEGIN value := x
+			END InitCharacterParameter;
+			
+			PROCEDURE Free*;
+			BEGIN 
+			END Free;
+		END CharacterParameter;
+		
+		TextParameter* = OBJECT(Parameter)
+			VAR value-: Basic.String;
+			
+			PROCEDURE &InitTextParameter*(x: ARRAY OF CHAR);
+			BEGIN value := Basic.NewString(x)
+			END InitTextParameter;
+			
+			PROCEDURE Free*;
+			BEGIN DELETE(value)
+			END Free;
+		END TextParameter;
+		
+		IntegerParameter* = OBJECT(Parameter)
+			VAR value: LONGINT;
+			
+			PROCEDURE &InitIntegerParameter*(x: LONGINT);
+			BEGIN value := x
+			END InitIntegerParameter;
+			
+			PROCEDURE Free*;
+			BEGIN 
+			END Free;
+		END IntegerParameter;
+		
+		RealParameter* = OBJECT(Parameter)
+			VAR value: REAL;
+			
+			PROCEDURE &InitRealParameter*(x: REAL);
+			BEGIN value := x
+			END InitRealParameter;
+			
+			PROCEDURE Free*;
+			BEGIN
+			END Free;
+		END RealParameter;
+		
+		ParameterList* = OBJECT(Basic.List)
+			PROCEDURE Add*(x: PTR);
+			BEGIN ASSERT(x IS Parameter); Add^(x)
+			END Add;
+			
+			PROCEDURE GetParameter*(index: LONGINT): Parameter;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(Parameter)
+			END GetParameter;
+			
+			PROCEDURE AddCharacter*(x: CHAR);
+			VAR par: CharacterParameter;
+			BEGIN NEW(par, x); Add(par)
+			END AddCharacter;
+			
+			PROCEDURE AddText*(x: ARRAY OF CHAR);
+			VAR par: TextParameter;
+			BEGIN NEW(par, x); Add(par)
+			END AddText;
+			
+			PROCEDURE AddInteger*(x: LONGINT);
+			VAR par: IntegerParameter;
+			BEGIN NEW(par, x); Add(par)
+			END AddInteger;
+			
+			PROCEDURE AddReal*(x: REAL);
+			VAR par: RealParameter;
+			BEGIN NEW(par, x); Add(par)
+			END AddReal;
+			
+			PROCEDURE Free*;
+			VAR i: LONGINT; x: Parameter;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetParameter(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END ParameterList;
+		
+		SystemCommunication = OBJECT
+			VAR
+				declaration: InterfaceDeclaration;
+				buffer: Address;
+			
+			PROCEDURE &InitSystemCommunication(intDecl: InterfaceDeclaration);
+			BEGIN ASSERT(intDecl # NIL); declaration := intDecl; buffer := NilValue
+			END InitSystemCommunication;
+			
+			PROCEDURE Free;
+			BEGIN declaration := NIL; buffer := NilValue
+			END Free;
+		END SystemCommunication;
+		
+		SystemCommunicationList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS SystemCommunication); Add^(x)
+			END Add;
+			
+			PROCEDURE GetSystemCommunication(index: LONGINT): SystemCommunication;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(SystemCommunication)
+			END GetSystemCommunication;
+			
+			PROCEDURE FindSystemCommunication(decl: InterfaceDeclaration): SystemCommunication;
+			VAR i: LONGINT; x: SystemCommunication;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetSystemCommunication(i); 
+					IF x.declaration = decl THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindSystemCommunication;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; x: SystemCommunication;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetSystemCommunication(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END SystemCommunicationList;
+		
+		SystemComponent = OBJECT
+			VAR
+				name: Basic.String;
+				component: Address;
+				template: ComponentTemplate;
+				communications: SystemCommunicationList;
+				finalizing: BOOLEAN;
+			
+			PROCEDURE &InitSystemComponent(str: ARRAY OF CHAR; com: Address; templ: ComponentTemplate);
+			BEGIN name := Basic.NewString(str); component := com; template := templ; NEW(communications); finalizing := FALSE
+			END InitSystemComponent;
+			
+			PROCEDURE Free;
+			BEGIN DELETE(name); component := NilValue; template := NIL; communications.Free; DELETE(communications)
+			END Free;
+		END SystemComponent;
+		
+		SystemComponentList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS SystemComponent); Add^(x)
+			END Add;
+			
+			PROCEDURE GetSystemComponent(index: LONGINT): SystemComponent;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(SystemComponent)
+			END GetSystemComponent;
+			
+			PROCEDURE FindSystemComponent(name: ARRAY OF CHAR): SystemComponent;
+			VAR i: LONGINT; x: SystemComponent;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetSystemComponent(i);
+					IF x.name^ = name THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindSystemComponent;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; x: SystemComponent;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetSystemComponent(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END SystemComponentList;
+		
+		ServerProcess = PROCEDURE (buffer: Address; component, process: Address);
+		
+		ProcessArray = POINTER TO ARRAY OF Address;
+		
+	VAR 
+		lock: Concurrency.WaitLock;
+		componentTemplates: ComponentTemplateList;
+		interfaceSpecifications: InterfaceSpecificationList;
+		constList: ConstList;
+		codeList: CodeList;
+		trapRegions: TrapRegionList;
+		systemComponents: SystemComponentList;
+		log: FileSystem.Rider;
+		useLog: BOOLEAN;
+		inTrap: BOOLEAN;
+		
+	PROCEDURE RegisterComponentTemplate*(x: ComponentTemplate);
+	BEGIN
+		AcquireLock;
+		ASSERT(componentTemplates.FindComponentTemplate(x.name^) = NIL);
+		componentTemplates.Add(x);
+		ReleaseLock
+	END RegisterComponentTemplate;
+	
+	PROCEDURE FindComponentTemplate*(name: ARRAY OF CHAR): ComponentTemplate;
+	VAR x: ComponentTemplate;
+	BEGIN 
+		AcquireLock;
+		x := componentTemplates.FindComponentTemplate(name);
+		ReleaseLock; 
+		RETURN x
+	END FindComponentTemplate;
+	
+	PROCEDURE RegisterInterfaceSpecification*(x: InterfaceSpecification);
+	BEGIN
+		AcquireLock;
+		ASSERT(interfaceSpecifications.FindInterfaceSpecification(x.name^) = NIL);
+		interfaceSpecifications.Add(x);
+		ReleaseLock
+	END RegisterInterfaceSpecification;
+	
+	PROCEDURE FindInterfaceSpecification*(name: ARRAY OF CHAR): InterfaceSpecification;
+	VAR x: InterfaceSpecification;
+	BEGIN
+		AcquireLock;
+		x := interfaceSpecifications.FindInterfaceSpecification(name);
+		ReleaseLock;
+		RETURN x
+	END FindInterfaceSpecification;
+	
+	PROCEDURE RegisterConst*(const: Const);
+	BEGIN 
+		AcquireLock;
+		constList.Add(const);
+		ReleaseLock
+	END RegisterConst;
+	
+	PROCEDURE RegisterCode*(name: ARRAY OF CHAR; code: Code);
+	VAR trapRegion: TrapRegion;
+	BEGIN 
+		AcquireLock;
+		NEW(trapRegion, name, code); trapRegions.Add(trapRegion);
+		codeList.Add(code);
+		ReleaseLock
+	END RegisterCode;
+			
+	PROCEDURE CreateComponent*(template {UNTRACED}: ComponentTemplate; superCom: Address; 
+		timesync: BOOLEAN): Address;
+	VAR nofOffered, nofRequired, index: LONGINT; comAdr, listAdr, intConnAdr: Address; 
+	BEGIN
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofComponents) END;
+		nofOffered := template.offeredInterfaces.Length();
+		nofRequired := template.requiredInterfaces.Length();
+		ASSERT(template.size >= ComponentHeaderSize + (nofOffered + nofRequired) * InterfaceConnectionSize);
+		comAdr := NewBlock(template.size);
+		SYSTEM.PUT32(comAdr + ComponentTemplateOffset, template);
+		SYSTEM.PUT32(comAdr + ComponentSpinLockOffset, Processors.Unlocked);
+		SYSTEM.PUT32(comAdr + ComponentSuperComOffset, superCom);
+		Concurrency.InitializeProcessList(comAdr + ComponentLockListOffset);
+		Concurrency.InitializeProcessList(comAdr + ComponentAwaitListOffset);
+		Concurrency.InitializeProcessList(comAdr + ComponentPassiveUnsortedOffset);
+		Concurrency.InitializeProcessList(comAdr + ComponentPassiveSortedOffset);
+		Concurrency.InitializeProcessList(comAdr + ComponentExternalWaitOffset);
+		SYSTEM.PUT8(comAdr + ComponentLifeStateOffset, LifeStateCreated);
+		SYSTEM.PUT8(comAdr + ComponentTerminatedOffset, FALSE);
+		SYSTEM.PUT8(comAdr + ComponentSynchronizedOffset, timesync);
+		SYSTEM.PUT32(comAdr + ComponentLocalProcCounterOffset, 0);
+		SYSTEM.PUT32(comAdr + ComponentLocalWaitCounterOffset, 0);
+		SYSTEM.PUT32(comAdr + ComponentSyncProcCounterOffset, 0);
+		SYSTEM.PUT32(comAdr + ComponentPassiveCounterOffset, 0);
+		SYSTEM.PUT32(comAdr + ComponentLockCounterOffset, NoLock);
+		SYSTEM.PUT32(comAdr + ComponentVirtualTimeOffset, 0);
+		FOR index := 0 TO nofOffered-1 DO
+			intConnAdr := comAdr + ComponentHeaderSize + index * InterfaceConnectionSize;
+			InitializeInterfaceConnection(intConnAdr, comAdr)
+		END;
+		FOR index := 0 TO nofRequired-1 DO
+			intConnAdr := comAdr + ComponentHeaderSize + (nofOffered + index) * InterfaceConnectionSize;
+			InitializeInterfaceConnection(intConnAdr, comAdr)
+		END;
+		Call(comAdr, template.initializerCodeAdr);
+		RETURN comAdr
+	END CreateComponent;
+		
+	PROCEDURE InitializeInterfaceConnection(connAdr: Address; com: Address);
+	BEGIN
+		SYSTEM.PUT8(connAdr + InterfaceConnFlagOffset, ConnectionFlagNone);
+		SYSTEM.PUT32(connAdr + InterfaceConnReferenceOffset, NilValue);
+		SYSTEM.PUT32(connAdr + InterfaceConnComponentOffset, com);
+		SYSTEM.PUT32(connAdr + InterfaceConnCounterOffset, 0);
+		SYSTEM.PUT32(connAdr + InterfaceConnCommCounterOffset, 0)
+	END InitializeInterfaceConnection;
+	
+	PROCEDURE FinalizeComponent*(component: Address);
+	VAR templatePtr {UNTRACED}: PTR; template: ComponentTemplate;
+	BEGIN
+		IF component # NilValue THEN
+			SYSTEM.GET(component + ComponentTemplateOffset, templatePtr);
+			template := templatePtr(ComponentTemplate);
+			SYSTEM.PUT8(component + ComponentTerminatedOffset, TrueValue);
+			SignalExternal(component);
+			Call(component, template.finalizerCodeAdr)
+		END
+	END FinalizeComponent;
+			
+	PROCEDURE DeleteComponent*(VAR component: Address; currentProcess: Address);
+	VAR state: SHORTINT; localCount, syncCount: LONGINT;
+	BEGIN
+		IF component # NilValue THEN
+			AcquireComponent2(component, currentProcess);
+			REPEAT
+				SYSTEM.GET(component + ComponentLifeStateOffset, state);
+				IF state # LifeStateFinalized THEN
+					WaitExternal(component, currentProcess)
+				END
+			UNTIL state = LifeStateFinalized;
+			REPEAT
+				SYSTEM.GET(component + ComponentLocalProcCounterOffset, localCount);
+				SYSTEM.GET(component + ComponentSyncProcCounterOffset, syncCount);
+				IF (localCount # 0) OR (syncCount # 0) THEN
+					ReleaseComponent(component);
+					Concurrency.SuspendReady(currentProcess);
+					AcquireComponent(component)
+				END
+			UNTIL (localCount = 0) & (syncCount = 0);
+			ReleaseComponent(component);
+			IF Basic.StatisticsEnabled THEN Basic.AtomicDec(Basic.statistics.nofComponents) END;
+			DeleteBlock(component)
+		END
+	END DeleteComponent;
+	
+	(** interface # NIL if process has communication buffer *)
+	PROCEDURE CreateProcess*(component: Address; processSize, ebpOffset, espOffset: LONGINT; 
+		codeAddress: Address; servedInterface {UNTRACED}: InterfaceSpecification): Address;
+	VAR processAdr: Address;
+	BEGIN
+		processAdr := InternalCreateProcess(component, processSize, ebpOffset, espOffset, codeAddress, servedInterface);
+		Concurrency.SetReady(processAdr); 
+		RETURN processAdr
+	END CreateProcess;
+	
+	PROCEDURE InternalCreateProcess(component: Address; processSize, ebpOffset, espOffset: LONGINT; 
+		codeAddress: Address; servedInterface {UNTRACED}: InterfaceSpecification): Address;
+	CONST StackReserve = 64;
+	VAR processAdr, buffer: Address; 
+	BEGIN
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofProcesses) END;
+		ASSERT(processSize >= ProcessHeaderSize); ASSERT(ebpOffset + ProcessTailSize <= processSize);
+		ASSERT(espOffset + 4 <= ebpOffset);
+		IF servedInterface # NIL THEN 
+			INC(processSize, CommunicationBufferSize(servedInterface)) 
+		END;
+		processAdr := NewBlock(processSize);
+		SYSTEM.PUT32(processAdr + ProcessBackupPCOffset, codeAddress);
+		SYSTEM.PUT32(processAdr + ProcessBackupESPOffset, processAdr + espOffset);
+		SYSTEM.PUT32(processAdr + ProcessBackupEBPOffset, processAdr + ebpOffset);
+		SYSTEM.PUT32(processAdr + ProcessStackLimitOffset, processAdr + ProcessHeaderSize + StackReserve);
+		SYSTEM.PUT32(processAdr + ProcessPrevProcessOffset, NilValue);
+		SYSTEM.PUT32(processAdr + ProcessNextProcessOffset, NilValue);
+		SYSTEM.PUT32(processAdr + ProcessHeaderCompOffset, component);
+		SYSTEM.PUT8(processAdr + ProcessAwaitMessageOffset, FALSE);
+		SYSTEM.PUT32(processAdr + ProcessNextTimeOffset, 0);
+		SYSTEM.PUT32(processAdr + ebpOffset + ProcessTailNil1Offset, NilValue);
+		SYSTEM.PUT32(processAdr + ebpOffset + ProcessTailNil2Offset, NilValue);
+		SYSTEM.PUT32(processAdr + ebpOffset + ProcessTailSelfProcessOffset, processAdr);
+		SYSTEM.PUT32(processAdr + ebpOffset + ProcessTailComponentOffset, component);
+		IF servedInterface # NIL THEN
+			buffer := processAdr + ebpOffset + ProcessTailCommBufferOffset;
+			InitializeCommunicationBuffer(buffer, servedInterface)
+		END;
+		AdjustProcessCounter(component, 1);
+		RETURN processAdr
+	END InternalCreateProcess;
+	
+	PROCEDURE DeleteProcess*(VAR process: Address);
+	VAR component, procCopy: Address;
+	BEGIN 
+		IF Basic.StatisticsEnabled THEN Basic.AtomicDec(Basic.statistics.nofProcesses) END;
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component); ASSERT(component # NilValue);
+		AdjustProcessCounter(component, -1);
+		procCopy := process; process := NilValue;
+		Concurrency.ReturnToSystemAndExecute(Heap.Delete, procCopy);
+		HALT(80) (* not reachable *)
+	END DeleteProcess;
+	
+	PROCEDURE AdjustProcessCounter(component: Address; inc: LONGINT);
+	VAR syncCom: Address; localCount, syncCount, waitCount: LONGINT;
+	BEGIN
+		(* register in current component *)
+		AcquireComponent(component);
+		SYSTEM.GET(component + ComponentLocalProcCounterOffset, localCount); INC(localCount, inc);
+		SYSTEM.PUT32(component + ComponentLocalProcCounterOffset, localCount);
+		syncCom := TimeSyncComponent(component);
+		IF component # syncCom THEN AcquireComponent0(syncCom) END;
+		SYSTEM.GET(syncCom + ComponentSyncProcCounterOffset, syncCount); INC(syncCount, inc);
+		ASSERT(syncCount >= 0);
+		SYSTEM.PUT32(syncCom + ComponentSyncProcCounterOffset, syncCount);
+		SYSTEM.GET(component + ComponentLocalWaitCounterOffset, waitCount);
+		ASSERT(waitCount >= 0);
+		IF localCount = waitCount THEN
+			SignalPassiveProcesses(component)
+		END;
+		InternalSignalExternal(component);
+		IF component # syncCom THEN ReleaseComponent(syncCom) END;
+		ReleaseComponent(component)
+	END AdjustProcessCounter;
+						
+	PROCEDURE Connect*(sourceConnection, targetConnection: Address; currentProcess: Address);
+	VAR flag: SHORTINT; reference: Address;
+	BEGIN
+		SYSTEM.GET(sourceConnection + InterfaceConnFlagOffset, flag);
+		ASSERT(flag = ConnectionFlagNone);
+		SYSTEM.GET(sourceConnection + InterfaceConnReferenceOffset, reference);
+		IF reference # NilValue THEN HALT(334) END; (* cannout change interface *)
+
+		Basic.AtomicIncByAdr(targetConnection + InterfaceConnCounterOffset);
+		
+		SYSTEM.PUT32(sourceConnection + InterfaceConnReferenceOffset, targetConnection);
+		SYSTEM.PUT8(sourceConnection + InterfaceConnFlagOffset, ConnectionFlagRedirected)
+	END Connect;
+	
+	PROCEDURE Disconnect*(connection: Address; currentProcess: Address);
+	VAR targetConn: Address; flag: SHORTINT; connListPtr {UNTRACED}: PTR; connList: ConnectionList; i: LONGINT; 
+		subAdr: Address; commCounter: LONGINT;
+	BEGIN
+		SYSTEM.GET(connection + InterfaceConnFlagOffset, flag);
+		IF (flag = ConnectionFlagRedirected) OR (flag = ConnectionFlagImplemented) THEN
+			REPEAT
+				SYSTEM.GET(connection + InterfaceConnCommCounterOffset, commCounter); ASSERT(commCounter >= 0);
+				IF commCounter > 0 THEN
+					Concurrency.SuspendReady(currentProcess)
+				END
+			UNTIL commCounter = 0;
+			IF flag = ConnectionFlagRedirected THEN
+				SYSTEM.GET(connection + InterfaceConnReferenceOffset, targetConn);
+				IF targetConn # NilValue THEN
+					Basic.AtomicDecByAdr(targetConn + InterfaceConnCounterOffset)
+				END
+			END;
+			SYSTEM.PUT32(connection + InterfaceConnReferenceOffset, NilValue);
+			SYSTEM.PUT8(connection + InterfaceConnFlagOffset, ConnectionFlagNone)
+		ELSIF flag = ConnectionFlagCollection THEN
+			SYSTEM.GET(connection + InterfaceConnReferenceOffset, connListPtr); ASSERT(connListPtr # NIL);
+			connList := connListPtr(ConnectionList);
+			connList.Lock;
+			FOR i := 0 TO connList.Length()-1 DO
+				subAdr := connList.GetConnection(i);
+				Disconnect(subAdr, currentProcess)
+			END;
+			connList.Unlock
+		ELSIF flag = ConnectionFlagNone THEN (* ok *)
+		ELSE HALT(111)
+		END
+	END Disconnect;
+	
+	PROCEDURE AwaitDisconnected*(currentProcess: Address; connection: Address);
+	VAR counter, subCounter: LONGINT; flag: SHORTINT; connListPtr {UNTRACED}: PTR; 
+		connList: ConnectionList; i: LONGINT; subAdr: Address;
+	BEGIN
+		SYSTEM.GET(connection + InterfaceConnFlagOffset, flag);
+		REPEAT
+			IF (flag = ConnectionFlagRedirected) OR (flag = ConnectionFlagImplemented) THEN
+				SYSTEM.GET(connection + InterfaceConnCounterOffset, counter)
+			ELSIF flag = ConnectionFlagCollection THEN
+				SYSTEM.GET(connection + InterfaceConnReferenceOffset, connListPtr); ASSERT(connListPtr # NIL);
+				connList := connListPtr(ConnectionList);
+				counter := 0;
+				connList.Lock;
+				FOR i := 0 TO connList.Length()-1 DO
+					subAdr := connList.GetConnection(i);
+					SYSTEM.GET(subAdr + InterfaceConnCounterOffset, subCounter);
+					INC(counter, subCounter)
+				END;
+				connList.Unlock
+			ELSIF flag = ConnectionFlagNone THEN (* ok *)
+			ELSE
+				HALT(111)
+			END;
+			IF counter > 0 THEN 
+				Concurrency.SuspendReady(currentProcess) 
+			END
+		UNTIL counter = 0
+	END AwaitDisconnected;
+	
+	PROCEDURE SelectInterface*(component: Address; offered: BOOLEAN; spec {UNTRACED}: PTR): Address;
+	VAR resultAdr: Address; interface: InterfaceSpecification; templatePtr {UNTRACED}: PTR; 
+		template: ComponentTemplate; index: LONGINT; list: InterfaceDeclarationList; decl: InterfaceDeclaration;
+	BEGIN
+		SYSTEM.GET(component + ComponentTemplateOffset, templatePtr);
+		template := templatePtr(ComponentTemplate);
+		interface := spec(InterfaceSpecification);
+		IF offered THEN list := template.offeredInterfaces ELSE list := template.requiredInterfaces END;
+		decl := list.FindInterfaceDeclaration(interface);
+		ASSERT(decl # NIL);
+		index := list.IndexOf(decl); ASSERT(index >= 0);
+		IF offered THEN
+			resultAdr := component + ComponentHeaderSize + index * InterfaceConnectionSize
+		ELSE
+			resultAdr := component + ComponentHeaderSize + (template.offeredInterfaces.Length() + index) * InterfaceConnectionSize
+		END;
+		RETURN resultAdr
+	END SelectInterface;
+	
+	PROCEDURE InterfaceTest*(component: Address; offered: BOOLEAN; spec {UNTRACED}: PTR; 
+		min, max: LONGINT): BOOLEAN;
+	VAR interface: InterfaceSpecification; templatePtr {UNTRACED}: PTR; template: ComponentTemplate;
+		list: InterfaceDeclarationList; decl: InterfaceDeclaration; result: BOOLEAN;
+	BEGIN
+		SYSTEM.GET(component + ComponentTemplateOffset, templatePtr);
+		template := templatePtr(ComponentTemplate);
+		interface := spec(InterfaceSpecification);
+		IF offered THEN list := template.offeredInterfaces ELSE list := template.requiredInterfaces END;
+		decl := list.FindInterfaceDeclaration(interface);
+		result := (decl # NIL) & (decl.minNumber = min) & (decl.maxNumber = max);
+		RETURN result
+	END InterfaceTest;
+											
+	PROCEDURE CountConnections*(connection: Address): LONGINT;
+	VAR flag: SHORTINT; connListPtr {UNTRACED}: PTR; connList: ConnectionList; count: LONGINT;
+	BEGIN 
+		SYSTEM.GET(connection + InterfaceConnFlagOffset, flag); ASSERT(flag = ConnectionFlagCollection);
+		SYSTEM.GET(connection + InterfaceConnReferenceOffset, connListPtr); ASSERT(connListPtr # NIL);
+		connList := connListPtr(ConnectionList);
+		connList.Lock;
+		count := connList.Length();
+		connList.Unlock;
+		IF count < connList.min THEN count := connList.min END;
+		RETURN count
+	END CountConnections;
+	
+	PROCEDURE CreateConnectionList*(connection: Address; min, max: LONGINT);
+	VAR flag: SHORTINT; component: Address; connList {UNTRACED}: ConnectionList;
+	BEGIN
+		SYSTEM.GET(connection + InterfaceConnFlagOffset, flag); ASSERT(flag = ConnectionFlagNone);
+		SYSTEM.GET(connection + InterfaceConnComponentOffset, component); ASSERT(component # NilValue);
+		NEW(connList, component, min, max);
+		SYSTEM.PUT32(connection + InterfaceConnReferenceOffset, connList);
+		SYSTEM.PUT8(connection + InterfaceConnFlagOffset, ConnectionFlagCollection)
+	END CreateConnectionList;
+	
+	PROCEDURE DeleteConnectionList*(connection: Address);
+	VAR flag: SHORTINT; connListPtr {UNTRACED}: PTR; connList {UNTRACED}: ConnectionList; 
+	BEGIN 
+		SYSTEM.GET(connection + InterfaceConnFlagOffset, flag); ASSERT(flag = ConnectionFlagCollection);
+		SYSTEM.GET(connection + InterfaceConnReferenceOffset, connListPtr); ASSERT(connListPtr # NIL);
+		connList := connListPtr(ConnectionList); connListPtr := NIL;
+		connList.Free; DELETE(connList);
+		SYSTEM.PUT32(connection + InterfaceConnReferenceOffset, NilValue)
+	END DeleteConnectionList;
+	
+	PROCEDURE SelectIndexedConnection*(connection: Address; index: LONGINT; currentProcess: Address): Address;
+	VAR flag: SHORTINT; connListPtr {UNTRACED}: PTR; connList: ConnectionList; adr: Address;
+	BEGIN
+		REPEAT
+			SYSTEM.GET(connection + InterfaceConnFlagOffset, flag);
+			IF flag = ConnectionFlagNone THEN
+				Concurrency.SuspendReady(currentProcess)
+			END
+		UNTIL flag # ConnectionFlagNone;
+		ASSERT(flag = ConnectionFlagCollection);
+		SYSTEM.GET(connection + InterfaceConnReferenceOffset, connListPtr); ASSERT(connListPtr # NIL);
+		connList := connListPtr(ConnectionList);
+		ASSERT((index >= 1) & (index <= connList.max), 7); (* index trap *)
+		connList.Lock;
+		adr := connList.GetConnection(index - 1);
+		connList.Unlock;
+		RETURN adr
+	END SelectIndexedConnection;
+	
+	PROCEDURE CreateCommBufferList*(VAR list: PTR; min, max: LONGINT);
+	VAR commList: CommunicationBufferList;
+	BEGIN
+		ASSERT(list = NIL);
+		NEW(commList, min, max);
+		list := commList
+	END CreateCommBufferList;
+	
+	PROCEDURE DeleteCommBufferList*(VAR list: PTR);
+	VAR commList: CommunicationBufferList;
+	BEGIN
+		ASSERT(list # NIL); commList := list(CommunicationBufferList);
+		list := NIL; 
+		commList.Free; DELETE(commList)
+	END DeleteCommBufferList;
+	
+	PROCEDURE SelectIndexedCommunication*(list {UNTRACED}: PTR; index: LONGINT): Address;
+	VAR commList: CommunicationBufferList; adr: Address;
+	BEGIN 
+		ASSERT(list # NIL); commList := list(CommunicationBufferList);
+		ASSERT((index >= 1) & (index <= commList.max), 7); (* index trap *)
+		adr := commList.GetCommunication(index - 1);
+		RETURN adr
+	END SelectIndexedCommunication;
+	
+	PROCEDURE CloseCommunicationList*(VAR list: PTR; currentProcess: Address);
+	VAR commList: CommunicationBufferList; adr: Address; i: LONGINT;
+	BEGIN
+		ASSERT(list # NIL); commList := list(CommunicationBufferList);
+		FOR i := 0 TO commList.Length()-1 DO
+			adr := commList.GetCommunication(i);
+			CloseCommunication(adr, currentProcess)
+		END
+	END CloseCommunicationList;
+		
+	PROCEDURE OpenCommunication*(conn: Address; VAR buffer: Address; currentProcess: Address);
+	VAR flag: SHORTINT; sourceConn, targetConn, codeAdr: Address; component: Address;
+	BEGIN
+		IF buffer = NilValue THEN
+			sourceConn := conn;
+			REPEAT
+				REPEAT
+					SYSTEM.GET(conn + InterfaceConnFlagOffset, flag);
+					IF flag = ConnectionFlagNone THEN
+						Concurrency.SuspendReady(currentProcess)
+					END;
+				UNTIL flag # ConnectionFlagNone;
+				IF flag = ConnectionFlagRedirected THEN
+					REPEAT
+						SYSTEM.GET(conn + InterfaceConnReferenceOffset, targetConn);
+						IF targetConn = NilValue THEN
+							Concurrency.SuspendReady(currentProcess)
+						END
+					UNTIL targetConn # NilValue;
+					Basic.AtomicIncByAdr(conn + InterfaceConnCommCounterOffset);
+					conn := targetConn
+				ELSE
+					ASSERT(flag = ConnectionFlagImplemented)
+				END
+			UNTIL flag = ConnectionFlagImplemented;
+			SYSTEM.GET(conn + InterfaceConnComponentOffset, component); ASSERT(component # NilValue);
+			SYSTEM.GET(conn + InterfaceConnReferenceOffset, codeAdr); ASSERT(codeAdr # NilValue);
+			buffer := CallWithResult(component, codeAdr); ASSERT(buffer # NilValue);
+			SYSTEM.PUT32(buffer + CommSourceConnectionOffset, sourceConn)
+		END
+	END OpenCommunication;
+	
+	PROCEDURE CloseCommunication*(bufferAdr: Address; currentProcess: Address);
+	VAR entryAdr: Address; last: LONGINT; buffer: Address; conn, targetConn: Address; flag: SHORTINT;
+	BEGIN 
+		SYSTEM.GET(bufferAdr, buffer);
+		IF buffer # NilValue THEN
+			SYSTEM.GET(buffer + CommSourceConnectionOffset, conn);
+			entryAdr := WaitToSend(buffer, currentProcess);
+			CompleteSend(entryAdr, buffer, currentProcess, FinishMessage);
+			SYSTEM.PUT32(bufferAdr, NilValue);
+			REPEAT
+				SYSTEM.GET(conn + InterfaceConnFlagOffset, flag);
+				ASSERT(flag # ConnectionFlagNone);
+				IF flag = ConnectionFlagRedirected THEN
+					SYSTEM.GET(conn + InterfaceConnReferenceOffset, targetConn);
+					ASSERT(targetConn # NilValue);
+					Basic.AtomicDecByAdr(conn + InterfaceConnCommCounterOffset);
+					conn := targetConn
+				ELSE ASSERT(flag = ConnectionFlagImplemented)
+				END
+			UNTIL flag = ConnectionFlagImplemented
+		END
+	END CloseCommunication;
+	
+	PROCEDURE WaitToSend*(buffer: Address; currentProcess: Address): Address; (* returns address to buffer entry *)
+	VAR first, last, index, entrySize: LONGINT;
+	BEGIN
+		SYSTEM.GET(buffer + CommunicationEntrySizeOffset, entrySize); 
+		ASSERT(entrySize >= CommEntryHeaderSize);
+		AcquireBuffer(buffer);
+		REPEAT
+			SYSTEM.GET(buffer + CommunicationFirstOffset, first);
+			SYSTEM.GET(buffer + CommunicationLastOffset, last);
+			IF last - first >= CommunicationBufferCapacity THEN
+				WaitInCommunication(buffer, currentProcess)
+			END
+		UNTIL last - first < CommunicationBufferCapacity;
+		ReleaseBuffer(buffer);
+		index := last MOD CommunicationBufferCapacity;
+		RETURN buffer + CommunicationBufferHeaderSize + index * entrySize
+	END WaitToSend;
+	
+	PROCEDURE CompleteSend*(entryAdr, buffer, currentProcess: Address; messageId: LONGINT);
+	VAR last: LONGINT; interface {UNTRACED}: PTR;
+	BEGIN
+		AcquireBuffer(buffer);
+		SYSTEM.PUT32(entryAdr + CommEntryMessageOffset, messageId);
+		SYSTEM.PUT32(entryAdr + CommEntrySenderOffset, currentProcess);
+		
+		(* INC(buffer.last) *)
+		SYSTEM.GET(buffer + CommunicationLastOffset, last); INC(last);
+		SYSTEM.PUT32(buffer + CommunicationLastOffset, last);
+		
+		SYSTEM.GET(buffer + CommunicationInterfaceOffset, interface);
+		CheckProtocol(buffer, interface(InterfaceSpecification), messageId);
+		SignalCommunication(buffer) (* releases buffer lock *)
+	END CompleteSend;
+			
+	PROCEDURE Send(buffer: Address; currentProcess: Address; messageId: LONGINT; parameters: ParameterList);
+	VAR entryAdr, val: Address; i: LONGINT; par: Parameter;
+	BEGIN
+		entryAdr := WaitToSend(buffer, currentProcess);
+		FOR i := 0 TO parameters.Length()-1 DO
+			par := parameters.GetParameter(i);
+			IF par IS IntegerParameter THEN val := SYSTEM.VAL(Address, par(IntegerParameter).value)
+			ELSIF par IS RealParameter THEN val := SYSTEM.VAL(Address, par(RealParameter).value)
+			ELSIF par IS TextParameter THEN val := SYSTEM.VAL(Address, CopyText(par(TextParameter).value))
+			ELSIF par IS CharacterParameter THEN val := SYSTEM.VAL(Address, ORD(par(CharacterParameter).value))
+			ELSE HALT(111)
+			END;
+			SYSTEM.PUT32(entryAdr + CommEntryParameterOffset + i * 4, val)
+		END;
+		CompleteSend(entryAdr, buffer, currentProcess, messageId)
+	END Send;
+		
+	(* message entry *)
+	PROCEDURE AwaitMessage*(buffer: Address; currentProcess: Address; exclusiveLock: BOOLEAN): Address;
+	VAR entryAdr: Address; 
+	BEGIN
+		Unlock(currentProcess, exclusiveLock);
+		SYSTEM.PUT8(currentProcess + ProcessAwaitMessageOffset, TRUE);
+		entryAdr := WaitToReceive(buffer, currentProcess);
+		SYSTEM.PUT8(currentProcess + ProcessAwaitMessageOffset, FALSE);
+		Lock(currentProcess, exclusiveLock);
+		RETURN entryAdr
+	END AwaitMessage;
+	
+	PROCEDURE WaitToReceive*(buffer: Address; currentProcess: Address): Address; (* returns address to buffer entry *)
+	VAR first, last, index, entrySize: LONGINT; entryAdr: Address; sender: Address; inAwait: BOOLEAN;
+	BEGIN
+		SYSTEM.GET(currentProcess + ProcessAwaitMessageOffset, inAwait);
+		SYSTEM.GET(buffer + CommunicationEntrySizeOffset, entrySize);
+		ASSERT(entrySize >= CommEntryHeaderSize);
+		AcquireBuffer(buffer);
+		REPEAT
+			SYSTEM.GET(buffer + CommunicationFirstOffset, first);
+			SYSTEM.GET(buffer + CommunicationLastOffset, last);
+			IF first < last THEN 
+				index := first MOD CommunicationBufferCapacity;
+				entryAdr := buffer + CommunicationBufferHeaderSize + index * entrySize;
+				SYSTEM.GET(entryAdr + CommEntrySenderOffset, sender);
+				IF sender = currentProcess THEN
+					IF inAwait THEN
+						SetPassive(currentProcess) 
+					END;
+					WaitInCommunication(buffer, currentProcess)
+				END
+			ELSE
+				entryAdr := NilValue; sender := currentProcess;
+				IF inAwait THEN
+					SetPassive(currentProcess) 
+				END;
+				WaitInCommunication(buffer, currentProcess)
+			END
+		UNTIL (first < last) & (sender # currentProcess);
+		ReleaseBuffer(buffer);
+		ASSERT(entryAdr # NilValue);
+		RETURN entryAdr
+	END WaitToReceive;
+		
+	PROCEDURE CompleteReceive*(buffer: Address);
+	VAR first: LONGINT;
+	BEGIN
+		AcquireBuffer(buffer);
+		(* INC(buffer.first) *)
+		SYSTEM.GET(buffer + CommunicationFirstOffset, first); INC(first);
+		SYSTEM.PUT32(buffer + CommunicationFirstOffset, first);
+		
+		SignalCommunication(buffer) (* releases buffer *)
+	END CompleteReceive;
+		
+	PROCEDURE Receive(buffer: Address; currentProcess: Address; messageId: LONGINT; VAR parameters: ParameterList);
+	VAR entryAdr, val: Address; message, i, first: LONGINT; md: MessageDeclaration; type: LONGINT; 
+		str {UNTRACED}: Basic.String; interface {UNTRACED}: InterfaceSpecification;
+	BEGIN
+		SYSTEM.GET(buffer + CommunicationInterfaceOffset, interface);
+		entryAdr := WaitToReceive(buffer, currentProcess);
+		
+		SYSTEM.GET(entryAdr + CommEntryMessageOffset, message);
+		ASSERT(message = messageId, 212);
+		NEW(parameters); 
+		ASSERT(messageId >= 0);
+		md := interface.messageDeclarations.GetMessageDeclaration(messageId);
+		FOR i := 0 TO md.parameterTypes.Length()-1 DO
+			SYSTEM.GET(entryAdr + CommEntryParameterOffset + i * 4, val);
+			type := md.parameterTypes.GetItem(i);
+			IF type = IntegerTypeCode THEN
+				parameters.AddInteger(SYSTEM.VAL(LONGINT, val))
+			ELSIF type = RealTypeCode THEN
+				parameters.AddReal(SYSTEM.VAL(REAL, val))
+			ELSIF type = TextTypeCode THEN
+				IF val = NilValue THEN 
+					str := NIL; parameters.AddText("")
+				ELSE
+					str := SYSTEM.VAL(Basic.String, val);
+					parameters.AddText(str^)
+				END;
+				DeleteText(str)
+			ELSIF type = CharacterTypeCode THEN
+				parameters.AddCharacter(CHR(SYSTEM.VAL(LONGINT, val)))
+			ELSE HALT(111)
+			END
+		END;
+		CompleteReceive(buffer)
+	END Receive;
+	
+	PROCEDURE InputMessage*(buffer: Address; currentProcess: Address): LONGINT; (** returns message id *)
+	VAR first, last, entrySize, index, message: LONGINT; entryAdr: Address; sender: Address;
+	BEGIN
+		SYSTEM.GET(buffer + CommunicationEntrySizeOffset, entrySize);
+		SYSTEM.GET(buffer + CommunicationFirstOffset, first);
+		SYSTEM.GET(buffer + CommunicationLastOffset, last);
+		message := NoMessage;
+		IF first < last THEN 
+			index := first MOD CommunicationBufferCapacity;
+			entryAdr := buffer + CommunicationBufferHeaderSize + index * entrySize;
+			SYSTEM.GET(entryAdr + CommEntrySenderOffset, sender);
+			IF sender # currentProcess THEN
+				SYSTEM.GET(entryAdr + CommEntryMessageOffset, message)
+			END
+		END;
+		RETURN message
+	END InputMessage;
+	
+	PROCEDURE WaitInCommunication(buffer: Address; currentProcess: Address);
+	VAR waiting: Address;
+	BEGIN
+		AssertBufferLock(buffer);
+		SYSTEM.GET(buffer + CommWaitingProcessOffset, waiting); 
+		ASSERT(waiting = NilValue, 299); (* deadlock in protocol *)
+		SYSTEM.PUT32(buffer + CommWaitingProcessOffset, currentProcess);
+		Concurrency.SuspendWaiting(currentProcess, ReleaseBuffer, buffer);
+		AcquireBuffer(buffer)
+	END WaitInCommunication;
+	
+	PROCEDURE SignalCommunication(buffer: Address);
+	VAR process: Address; component: Address; inAwait: BOOLEAN;
+	BEGIN
+		AssertBufferLock(buffer);
+		SYSTEM.GET(buffer + CommWaitingProcessOffset, process); 
+		IF process # NilValue THEN
+			SYSTEM.PUT32(buffer + CommWaitingProcessOffset, NilValue);
+			ReleaseBuffer(buffer);
+			SYSTEM.GET(process + ProcessAwaitMessageOffset, inAwait);
+			SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+			IF inAwait THEN SetActive(process) END;
+			Concurrency.SetReady(process)
+		ELSE
+			ReleaseBuffer(buffer)
+		END
+	END SignalCommunication;
+		
+	PROCEDURE WaitExternal(component, process: Address);
+	BEGIN
+		AssertComponentLock(component);
+		Concurrency.AddProcessToList(component + ComponentExternalWaitOffset, process);
+		Concurrency.SuspendWaiting(process, ReleaseComponent, component);
+		AcquireComponent(component)
+	END WaitExternal;
+	
+	PROCEDURE AwaitInitializationEnd*(process: Address);
+	VAR component: Address; lifeState: SHORTINT;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		AcquireComponent(component);
+		REPEAT
+			SYSTEM.GET(component + ComponentLifeStateOffset, lifeState);
+			IF lifeState = LifeStateCreated THEN
+				WaitExternal(component, process)
+			END
+		UNTIL lifeState # LifeStateCreated;
+		ReleaseComponent(component)
+	END AwaitInitializationEnd;
+	
+	PROCEDURE AwaitFinalizationStart*(process: Address);
+	VAR component: Address; terminated: BOOLEAN; lifeState: SHORTINT; processCounter: LONGINT;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		SetPassive(process);
+		AcquireComponent(component);
+		REPEAT
+			SYSTEM.GET(component + ComponentTerminatedOffset, terminated);
+			SYSTEM.GET(component + ComponentLifeStateOffset, lifeState);
+			SYSTEM.GET(component + ComponentLocalProcCounterOffset, processCounter);
+			IF ~(terminated & (lifeState = LifeStateInactive) & (processCounter = 1)) THEN
+				WaitExternal(component, process)
+			END
+		UNTIL terminated & (lifeState = LifeStateInactive) & (processCounter = 1);
+		ReleaseComponent(component);
+		SetActive(process)
+	END AwaitFinalizationStart;
+	
+	PROCEDURE SignalExternal*(component: Address);
+	BEGIN
+		IF component # NilValue THEN
+			AcquireComponent(component); (* multiple sub-components may notify super-component in parallel *)
+			InternalSignalExternal(component);
+			ReleaseComponent(component)
+		END
+	END SignalExternal;
+	
+	PROCEDURE InternalSignalExternal(component: Address);
+	VAR first: Address;
+	BEGIN
+		AssertComponentLock(component);
+		IF SYSTEM.GET32(component + ComponentExternalWaitOffset + ProcessListFirstOffset) # NilValue THEN
+			REPEAT
+				SYSTEM.GET(component + ComponentExternalWaitOffset + ProcessListFirstOffset, first);
+				IF first # NilValue THEN
+					Concurrency.RemoveProcessFromList(component + ComponentExternalWaitOffset, first);
+					Concurrency.SetReady(first)
+				END;
+			UNTIL first = NilValue
+		END
+	END InternalSignalExternal;
+			
+	PROCEDURE CheckProtocol(buffer: Address; interface {UNTRACED}: InterfaceSpecification; messageId: LONGINT);
+	VAR state, nofColumns, pos: LONGINT;
+	BEGIN
+		SYSTEM.GET(buffer + CommProtocolStateOffset, state);
+		nofColumns := interface.messageDeclarations.Length() + ExtraColumns;
+		IF messageId >= 0 THEN
+			pos := state * nofColumns + messageId + ExtraColumns
+		ELSIF messageId = FinishMessage THEN
+			pos := state * nofColumns + FinishProtocolColumn
+		ELSE 
+		  HALT(111)
+		END;
+		state := ORD(interface.protocolStateMatrix[pos]);
+		ASSERT(state # ErrorProtocolRow, 300); (* protocol violation *)
+		SYSTEM.PUT32(buffer + CommProtocolStateOffset, state)
+	END CheckProtocol;
+	
+	PROCEDURE CanBeFinished(buffer: Address; interface: InterfaceSpecification): BOOLEAN;
+	VAR state, nofColumns, pos: LONGINT;
+	BEGIN
+		SYSTEM.GET(buffer + CommProtocolStateOffset, state);
+		nofColumns := interface.messageDeclarations.Length() + ExtraColumns;
+		pos := state * nofColumns + FinishProtocolColumn;
+		state := ORD(interface.protocolStateMatrix[pos]);
+		RETURN state = FinishProtocolRow
+	END CanBeFinished;
+	
+	PROCEDURE SelectFromCommSet*(instanceAdr, setAdr: Address; bufferIndex: LONGINT): Address;
+	VAR address: Address; instance: Address; set {UNTRACED}: CommunicationSet;
+	BEGIN
+		IF setAdr = NilValue THEN
+			(* use component-local communication *)
+			address := instanceAdr + 4 + bufferIndex * 4
+		ELSE
+			SYSTEM.GET(instanceAdr, instance); 
+			ASSERT(instance # NilValue, -14);
+			SYSTEM.GET(setAdr, set); 
+			IF set = NIL THEN
+				NEW(set); 
+				SYSTEM.PUT32(setAdr, set)
+			END;
+			address := set.GetCommBufferAdr(instance, bufferIndex)
+		END;
+		RETURN address
+	END SelectFromCommSet;
+	
+	PROCEDURE CloseAndDeleteCommSet*(setAdr: Address; currentProcess: Address);
+	VAR set {UNTRACED}: CommunicationSet; i: LONGINT; entry: CommunicationSetEntry; bufferAdr: Address;
+	BEGIN
+		IF setAdr # NilValue THEN
+			SYSTEM.GET(setAdr, set);
+			IF set # NIL THEN
+				FOR i := 0 TO set.Length()-1 DO
+					entry := set.GetEntry(i);
+					bufferAdr := SYSTEM.ADR(entry.buffer);
+					CloseCommunication(bufferAdr, currentProcess)
+				END;
+				entry := NIL;
+				SYSTEM.PUT32(setAdr, NilValue);
+				set.Free; DELETE(set)
+			END
+		END
+	END CloseAndDeleteCommSet;
+	
+	PROCEDURE Preempt*(process: Address);
+	VAR counter: LONGINT;
+	BEGIN
+		SYSTEM.PUTREG(SYSTEM.EDI, 0);
+		Concurrency.SuspendReady(process)
+	END Preempt;
+			
+	PROCEDURE WriteCharacter*(x: CHAR);
+	VAR ext: Address;
+	BEGIN
+		Concurrency.ExtendStack(ext, Concurrency.SystemStackSize);
+		IF useLog THEN FileSystem.Write(log, x) END;
+		Basic.OutCharacter(x);
+		Concurrency.ReduceStack(ext)
+	END WriteCharacter;
+
+	PROCEDURE WriteInteger*(x: LONGINT);
+	VAR ext: Address;
+	BEGIN
+		Concurrency.ExtendStack(ext, Concurrency.SystemStackSize);
+		IF useLog THEN WriteFileInteger(log, x) END;
+		Basic.OutInteger(x);
+		Concurrency.ReduceStack(ext)
+	END WriteInteger;
+	
+	PROCEDURE WriteHex*(x: LONGINT);
+	VAR ext: Address;
+	BEGIN
+		Concurrency.ExtendStack(ext, Concurrency.SystemStackSize);
+		IF useLog THEN WriteFileHex(log, x) END;
+		Basic.OutHexInt(x);
+		Concurrency.ReduceStack(ext)
+	END WriteHex;
+	
+	PROCEDURE WriteReal*(real: REAL);
+	VAR ext: Address;
+	BEGIN
+		Concurrency.ExtendStack(ext, Concurrency.SystemStackSize);
+		IF useLog THEN WriteFileReal(log, real) END;
+		Basic.OutReal(real);
+		Concurrency.ReduceStack(ext)
+	END WriteReal;
+	
+	PROCEDURE WriteText*(x {UNTRACED}: Basic.String);
+	VAR ext: Address;
+	BEGIN
+		IF x # NIL THEN
+			Concurrency.ExtendStack(ext, Concurrency.SystemStackSize);
+			IF useLog THEN WriteFileLine^(log, x^) END;
+			Basic.OutText(x^);
+			DeleteText(x);
+			Concurrency.ReduceStack(ext)
+		END
+	END WriteText;
+	
+	PROCEDURE WriteLine*;
+	VAR ext: Address;
+	BEGIN
+		Concurrency.ExtendStack(ext, Concurrency.SystemStackSize);
+		IF useLog THEN FileSystem.Write(log, 0DX); FileSystem.Write(log, 0AX) END;
+		Basic.OutLine;
+		Concurrency.ReduceStack(ext)
+	END WriteLine;
+	
+	PROCEDURE CreateText*(adr: Address): Basic.String;
+	VAR i, len: LONGINT; c: CHAR; s: Basic.String;
+	BEGIN
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofTexts) END;
+		len := 0; 
+		REPEAT
+			SYSTEM.GET(adr + len, c);
+			IF c # 0X THEN INC(len) END
+		UNTIL c = 0X;
+		NEW(s, len+1);
+		FOR i := 0 TO len-1 DO SYSTEM.GET(adr + i, s[i]) END;
+		s[len] := 0X;
+		RETURN s
+	END CreateText;
+	
+	PROCEDURE DeleteText*(VAR s: Basic.String);
+	BEGIN
+		IF s # NIL THEN
+			IF Basic.StatisticsEnabled THEN Basic.AtomicDec(Basic.statistics.nofTexts) END;
+			DELETE(s)
+		END
+	END DeleteText;
+
+	PROCEDURE CopyText*(x {UNTRACED}: Basic.String): Basic.String;
+	VAR copy: Basic.String;
+	BEGIN
+		IF x = NIL THEN copy := NIL 
+		ELSE
+			IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofTexts) END;
+			copy := Basic.CopyString(x)
+		END;
+		RETURN copy
+	END CopyText;
+	
+	PROCEDURE EqualText*(a {UNTRACED}, b {UNTRACED}: Basic.String): BOOLEAN;
+	VAR r: BOOLEAN;
+	BEGIN
+		IF (a # NIL) & (b # NIL) THEN r := a^ = b^
+		ELSIF a = NIL  THEN r := (b = NIL) OR (b^ = "")
+		ELSE r := a^ = ""
+		END;
+		IF a # NIL THEN DeleteText(a) END; 
+		IF b # NIL THEN DeleteText(b) END;
+		RETURN r
+	END EqualText;
+	
+	PROCEDURE LessText*(a {UNTRACED}, b {UNTRACED}: Basic.String): BOOLEAN;
+	VAR r: BOOLEAN;
+	BEGIN
+		IF (a # NIL) & (b # NIL) THEN r := a^ < b^
+		ELSIF a = NIL THEN r := (b # NIL) & ("" < b^)
+		ELSE r := FALSE
+		END;
+		IF a # NIL THEN DeleteText(a) END; 
+		IF b # NIL THEN DeleteText(b) END;
+		RETURN r
+	END LessText;
+	
+	PROCEDURE LessEqualText*(a {UNTRACED}, b {UNTRACED}: Basic.String): BOOLEAN;
+	VAR r: BOOLEAN;
+	BEGIN
+		IF (a # NIL) & (b # NIL) THEN r := a^ <= b^
+		ELSIF a = NIL THEN r := (b # NIL) & ("" <= b^)
+		ELSE r := FALSE
+		END;
+		IF a # NIL THEN DeleteText(a) END; 
+		IF b # NIL THEN DeleteText(b) END;
+		RETURN r
+	END LessEqualText;
+	
+	PROCEDURE SetTextLength*(VAR text: Basic.String; length: LONGINT);
+	BEGIN	
+		IF text # NIL THEN
+			DeleteText(text)
+		END;
+		ASSERT(text = NIL);
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofTexts) END;
+		NEW(text, length)
+	END SetTextLength;
+	
+	PROCEDURE SelectTextCharacter*(text {UNTRACED}: Basic.String; index: LONGINT): Address;
+	BEGIN
+		ASSERT(text # NIL, -14); (* NIL trap *)
+		RETURN SYSTEM.ADR(text[index])
+	END SelectTextCharacter;
+	
+	PROCEDURE TextLength*(text {UNTRACED}: Basic.String): LONGINT;
+	VAR len: LONGINT;
+	BEGIN 
+		IF text = NIL THEN len := 0;
+		ELSE len := LEN(text)
+		END;
+		RETURN len
+	END TextLength;
+	
+	PROCEDURE CharacterToText*(char: CHAR): Basic.String;
+	VAR s: Basic.String;
+	BEGIN
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofTexts) END;
+		NEW(s, 2); s[0] := char; s[1] := 0X;
+		RETURN s
+	END CharacterToText;
+	
+	(* Stack layout:
+		0[EBP]		-> old EBP
+		4[EBP]		-> return PC
+		8[EBP]		-> nilInit
+		12[EBP]	  -> elemSize
+		16[EBP]	  -> nofDims
+		20[EBP]	  -> ADR(collection)
+		24[EBP]	  -> len[nofDims-1]
+		..
+		(24 + (nofDims-1) * 4)[EBP] -> len[0] *)
+	PROCEDURE CreateArray*(VAR collection: Address; nofDims, elemSize: LONGINT; nilInit: BOOLEAN);
+	CONST ParameterOffset = 24;
+	VAR dims: ARRAY 32 OF LONGINT; i, nofElems, size, offset: LONGINT;
+	BEGIN
+		IF collection # NilValue THEN DeleteArray(collection) END;
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofCollections) END;
+		ASSERT(nofDims > 0);
+		FOR i := 0 TO nofDims-1 DO
+			dims[i] := SYSTEM.VAL(LONGINT, GetFromStack(ParameterOffset + (nofDims - 1 - i) * 4))
+		END;
+		nofElems := 1;
+		FOR i := 0 TO nofDims-1 DO
+			ASSERT(dims[i] >= 1); 
+			nofElems := nofElems * dims[i]
+		END;
+		size := ArrayHeaderSize + nofDims * 4 + nofElems * elemSize;
+		collection := NewBlock(size); 
+		SYSTEM.PUT32(collection + ArrayNofDimsOffset, nofDims);
+		SYSTEM.PUT32(collection + ArrayElemSizeOffset, elemSize);
+		FOR i := 0 TO nofDims-1 DO
+			SYSTEM.PUT32(collection + ArrayHeaderSize + i * 4, dims[i])
+		END;
+		IF nilInit THEN
+			ASSERT(elemSize MOD 4 = 0);
+			offset := ArrayHeaderSize + nofDims * 4; 
+			WHILE offset < size DO
+				SYSTEM.PUT32(collection + offset, NilValue);
+				INC(offset, 4)
+			END
+		END
+	END CreateArray;
+	
+	PROCEDURE DeleteArray*(VAR collection: Address);
+	BEGIN
+		IF collection # NilValue THEN
+			IF Basic.StatisticsEnabled THEN Basic.AtomicDec(Basic.statistics.nofCollections) END;
+			DeleteBlock(collection)
+		END
+	END DeleteArray;
+	
+	(* Stack layout:
+		0[EBP]		-> old EBP
+		4[EBP]		-> return PC
+		8[EBP]		-> process
+		12[EBP]		-> valueSize
+		16[EBP]	  -> nofKeys
+		20[EBP]	  -> ADR(collection)
+		24[EBP]	  -> keyTypeCode[nofKeys-1]
+		..
+		(24 + (nofKeys-1) * 4)[EBP] -> keyTypeCode[0] *)
+	PROCEDURE CreateCollection*(VAR collection: Collections.Collection; nofKeys, valueSize: LONGINT; 
+		process: Address);
+	CONST ParameterOffset = 24;
+	VAR i: LONGINT; keyTypes: Collections.KeyTypeCodeList;
+	BEGIN
+		ASSERT(collection = NIL);
+		IF Basic.StatisticsEnabled THEN Basic.AtomicInc(Basic.statistics.nofCollections) END;
+		FOR i := 0 TO nofKeys-1 DO
+			keyTypes[i] := SYSTEM.VAL(LONGINT, GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4))
+		END;
+		NEW(collection, nofKeys, valueSize, keyTypes)
+	END CreateCollection;
+	
+	PROCEDURE DeleteCollection*(VAR collection: Collections.Collection; process: Address);
+	BEGIN
+		ASSERT(collection # NIL);
+		IF Basic.StatisticsEnabled THEN Basic.AtomicDec(Basic.statistics.nofCollections) END;
+		collection.Free; DELETE(collection)
+	END DeleteCollection;
+	
+	PROCEDURE CopyKey(coll: Collections.Collection; VAR from, to: Collections.Key);
+	VAR i: LONGINT; s: Basic.String;
+	BEGIN
+		FOR i := 0 TO coll.nofKeys-1 DO
+			ASSERT(coll.keyTypes[i] # ComponentTypeCode);
+			IF coll.keyTypes[i] = TextTypeCode THEN
+				s := SYSTEM.VAL(Basic.String, from[i]);
+				IF s # NIL THEN s := CopyText(s) END;
+				to[i] := SYSTEM.VAL(Address, s)
+			ELSE
+				to[i] := from[i]
+			END
+		END
+	END CopyKey;
+	
+	PROCEDURE DeleteKey(coll: Collections.Collection; VAR key: Collections.Key);
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO coll.nofKeys-1 DO
+			ASSERT(coll.keyTypes[i] # ComponentTypeCode);
+			IF coll.keyTypes[i] = TextTypeCode THEN
+				DeleteText(SYSTEM.VAL(Basic.String, key[i]))
+			END
+		END
+	END DeleteKey;
+	
+	(** Stack layout:
+		0[EBP]   -> old EBP
+		4[EBP]   -> return PC
+		8[EBP]   -> nofKeys
+		12[EBP] -> collection
+		16[EBP] -> key[nofKeys-1]
+		..
+		(16 + (nofKeys -1) * 4)[EBP] -> key[0] *)
+	PROCEDURE CreateElement*(collection {UNTRACED}: Collections.Collection; nofKeys: LONGINT);
+	CONST ParameterOffset = 16;
+	VAR i: LONGINT; key: Collections.Key;
+	BEGIN
+		FOR i := 0 TO nofKeys-1 DO
+			key[i] := GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4)
+		END;
+		IF ~collection.ExistsElement(key) THEN
+			collection.CreateElement(key)
+		END;
+		DeleteKey(collection, key)
+	END CreateElement;
+	
+	(** Stack layout:
+		0[EBP]   -> old EBP
+		4[EBP]   -> return PC
+		8[EBP]   -> nofKeys
+		12[EBP] -> collection
+		16[EBP] -> key[nofKeys-1]
+		..
+		(16 + (nofKeys -1) * 4)[EBP] -> key[0] *)
+	PROCEDURE SelectElement*(collection {UNTRACED}: Collections.Collection; nofKeys: LONGINT): Address;
+	CONST ParameterOffset = 16;
+	VAR i: LONGINT; key: Collections.Key; result: Address;
+	BEGIN
+		FOR i := 0 TO nofKeys-1 DO
+			key[i] := GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4)
+		END;
+		result := collection.ElementValueAddress(key);
+		DeleteKey(collection, key);
+		RETURN result
+	END SelectElement;
+	
+	(** Stack layout:
+		0[EBP]   -> old EBP
+		4[EBP]   -> return PC
+		8[EBP]   -> nofKeys
+		11[EBP] -> collection
+		16[EBP] -> key[nofKeys-1]
+		..
+		(16 + (nofKeys -1) * 4)[EBP] -> key[0] *)
+	PROCEDURE ExistsElement*(collection {UNTRACED}: Collections.Collection; nofKeys: LONGINT): BOOLEAN;
+	CONST ParameterOffset = 16;
+	VAR i: LONGINT; key: Collections.Key; result: BOOLEAN;
+	BEGIN
+		FOR i := 0 TO nofKeys-1 DO
+			key[i] := GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4)
+		END;
+		result := collection.ExistsElement(key);
+		DeleteKey(collection, key);
+		RETURN result
+	END ExistsElement;
+	
+	(** Stack layout:
+		0[EBP]   -> old EBP
+		4[EBP]   -> return PC
+		8[EBP]   -> nofKeys
+		12[EBP] -> collection
+		16[EBP] -> key[nofKeys-1]
+		..
+		(16 + (nofKeys -1) * 4)[EBP] -> key[0] *)
+	PROCEDURE DeleteElement*(collection {UNTRACED}: Collections.Collection; nofKeys: LONGINT);
+	CONST ParameterOffset = 16;
+	VAR i: LONGINT; key: Collections.Key;
+	BEGIN
+		FOR i := 0 TO nofKeys-1 DO
+			key[i] := GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4)
+		END;
+		collection.RemoveElement(key);
+		DeleteKey(collection, key)
+	END DeleteElement;
+	
+	PROCEDURE ForeachStart*(collAdr: Address; VAR rider: LONGINT; isArray: BOOLEAN);
+	VAR coll: Collections.Collection;
+	BEGIN 
+		IF isArray THEN
+			rider := 0
+		ELSE
+			coll := SYSTEM.VAL(Collections.Collection, collAdr);
+			rider := coll.IterationStart()
+		END
+	END ForeachStart;
+	
+	PROCEDURE ForeachContinue*(collAdr: Address; rider: LONGINT; isArray: BOOLEAN): BOOLEAN;
+	VAR i, len, nofDims, nofElems: LONGINT; result: BOOLEAN; coll: Collections.Collection;
+	BEGIN 
+		IF isArray THEN 
+			SYSTEM.GET(collAdr + ArrayNofDimsOffset, nofDims); ASSERT(nofDims > 0);
+			nofElems := 1;
+			FOR i := 0 TO nofDims-1 DO
+				SYSTEM.GET(collAdr + ArrayHeaderSize + i * 4, len); ASSERT(len >= 1);
+				nofElems := nofElems * len
+			END;
+			result := rider < nofElems
+		ELSE
+			coll := SYSTEM.VAL(Collections.Collection, collAdr);		
+			result := coll.IterationContinue(rider)
+		END;
+		RETURN result
+	END ForeachContinue;
+	
+	(** stack layout for ForeachGetKey
+		0[EBP] -> caller EBP
+		4[EBP] -> caller PC
+		8[EBP] -> isArray
+		12[EBP] -> nofKeys
+		16[EBP] -> ADR(rider)
+		20[EBP] -> collection
+		24[EBP] -> ADR(key[nofKeys-1])
+		..
+		(24 + (nofKeys-1) * 4)[EBP] -> ADR(key[0]) *)
+	PROCEDURE ForeachGetKey*(collAdr: Address; rider: LONGINT; nofKeys: LONGINT; isArray: BOOLEAN);
+	CONST ParameterOffset = 24; 
+	VAR coll: Collections.Collection; i: LONGINT; adr: Address; type: Collections.KeyTypeCode; 
+		keySize: LONGINT; key: Collections.Key; pos, nofDims, len: LONGINT;
+	BEGIN
+		IF isArray THEN
+			SYSTEM.GET(collAdr + ArrayNofDimsOffset, nofDims); ASSERT(nofDims > 0); ASSERT(nofDims = nofKeys);
+			pos := rider;
+			FOR i := nofKeys-1 TO 0 BY -1 DO
+				adr := GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4);
+				SYSTEM.GET(collAdr + ArrayHeaderSize + i * 4, len); ASSERT(len >= 1);
+				SYSTEM.PUT32(adr, pos MOD len);
+				pos := pos DIV len
+			END
+		ELSE
+			coll := SYSTEM.VAL(Collections.Collection, collAdr);
+			coll.IterationGetKey(rider, key); (* key is already a copy *)
+			ASSERT(coll.nofKeys = nofKeys);
+			FOR i := 0 TO nofKeys-1 DO
+				adr := GetFromStack(ParameterOffset + (nofKeys - 1 - i) * 4);
+				type := coll.keyTypes[i];
+				IF (type = CharacterTypeCode) OR (type = BooleanTypeCode) THEN keySize := 1
+				ELSIF (type = IntegerTypeCode) OR (type = RealTypeCode) OR (type = TextTypeCode) THEN keySize := 4
+				ELSE HALT(111)
+				END;
+				IF keySize = 1 THEN SYSTEM.PUT8(adr, key[i])
+				ELSIF keySize = 4 THEN SYSTEM.PUT32(adr, key[i])
+				ELSE HALT(111)
+				END
+			END
+		END
+	END ForeachGetKey;
+
+	PROCEDURE ForeachGetValue*(collAdr: Address; rider: LONGINT; isArray: BOOLEAN): Address;
+	VAR coll: Collections.Collection; result: Address; i, nofDims, len, nofElems, elemSize: LONGINT;
+	BEGIN	
+		IF isArray THEN
+			SYSTEM.GET(collAdr + ArrayNofDimsOffset, nofDims); ASSERT(nofDims > 0);
+			SYSTEM.GET(collAdr + ArrayElemSizeOffset, elemSize); ASSERT(elemSize > 0);
+			nofElems := 1;
+			FOR i := 0 TO nofDims-1 DO
+				SYSTEM.GET(collAdr + ArrayHeaderSize + i * 4, len); ASSERT(len >= 1);
+				nofElems := nofElems * len
+			END;
+			ASSERT(rider < nofElems);
+			result := collAdr + ArrayHeaderSize + nofDims * 4 + rider * elemSize
+		ELSE
+			coll := SYSTEM.VAL(Collections.Collection, collAdr);
+			result := coll.IterationGetValueAddress(rider)
+		END;
+		RETURN result
+	END ForeachGetValue;
+	
+	PROCEDURE ForeachNext*(collAdr: Address; VAR rider: LONGINT; isArray: BOOLEAN);
+	VAR coll: Collections.Collection;
+	BEGIN
+		IF isArray THEN
+			INC(rider)			
+		ELSE
+			coll := SYSTEM.VAL(Collections.Collection, collAdr);
+			coll.IterationNext(rider)
+		END
+	END ForeachNext;
+	
+	PROCEDURE Random*(min, max: LONGINT): LONGINT;
+	VAR res: LONGINT;
+	BEGIN
+		res := min + ENTIER(Basic.RandomUniform() * (max + 1 - min));
+		RETURN res
+	END Random;
+	
+	(* use LONGINT as return type to have the result in EAX *)
+	PROCEDURE ArcSine*(x: REAL): LONGINT;
+	VAR res: REAL;
+	BEGIN
+		ASSERT((x >= -1) & (x <= 1), 100);
+		res := 2.0 * Basic.Arctan(x / (1.0 + Basic.Sqrt(1.0- x * x)));
+		RETURN SYSTEM.VAL(LONGINT, res)
+	END ArcSine;
+	
+	PROCEDURE ArcCosine*(x: REAL): LONGINT;
+	VAR res: REAL;
+	BEGIN
+		ASSERT((x >= -1) & (x <= 1), 100);
+		IF x = -1 THEN 
+			res := Basic.Pi
+		ELSE
+			res := 2.0 * Basic.Arctan(Basic.Sqrt(1.0- x * x) / (1.0 + x))
+		END;
+		RETURN SYSTEM.VAL(LONGINT, res)
+	END ArcCosine;
+	
+	PROCEDURE DetachComponent*(component, currentProcess: Address);
+	VAR template: ComponentTemplate; processCounter, nofOffered, k: LONGINT; connection: Address;
+	BEGIN
+		REPEAT
+			SYSTEM.GET(component + ComponentLocalProcCounterOffset, processCounter);
+			IF processCounter > 0 THEN
+				Concurrency.SuspendReady(currentProcess)
+			END
+		UNTIL processCounter = 0;
+		SYSTEM.GET(component + ComponentTemplateOffset, template);
+		nofOffered := template.offeredInterfaces.Length();
+		FOR k := 0 TO template.requiredInterfaces.Length()-1 DO
+			connection := component + ComponentHeaderSize + (nofOffered + k) * InterfaceConnectionSize;
+			Disconnect(connection, currentProcess)
+		END;
+		SYSTEM.PUT32(component + ComponentSuperComOffset, NilValue);
+		SYSTEM.PUT8(component + ComponentSynchronizedOffset, FALSE)
+	END DetachComponent;
+	
+	PROCEDURE AttachComponent*(component, superCom: Address; synchronous: BOOLEAN);
+	BEGIN
+		SYSTEM.PUT32(component + ComponentSuperComOffset, superCom);
+		SYSTEM.PUT8(component + ComponentSynchronizedOffset, synchronous)
+	END AttachComponent;
+		
+	(* system commands *)
+	PROCEDURE ExecuteCreateComponent(name: ARRAY OF CHAR; template: ComponentTemplate);
+	VAR component: Address; sysCom: SystemComponent;
+	BEGIN
+		AcquireLock;
+		IF systemComponents.FindSystemComponent(name) = NIL THEN
+			component := CreateComponent(template, NilValue, FALSE);
+			NEW(sysCom, name, component, template);
+			systemComponents.Add(sysCom)
+		ELSE
+			Basic.OutText("Component "); Basic.OutText(name); 
+			Basic.OutText(" already existent"); Basic.OutLine
+		END;
+		ReleaseLock
+	END ExecuteCreateComponent;
+	
+	PROCEDURE ExecuteDeleteComponent(name: ARRAY OF CHAR);
+	VAR sysCom: SystemComponent; comm: SystemCommunication; i: LONGINT;
+	BEGIN
+		AcquireLock;
+		sysCom := systemComponents.FindSystemComponent(name);
+		IF name = SystemComponentName THEN 
+			Basic.OutText("Cannot delete system component"); Basic.OutLine; sysCom := NIL
+		ELSIF sysCom # NIL THEN
+			IF sysCom.finalizing THEN
+				ReleaseLock;
+				Basic.OutText("Component is in finalization"); Basic.OutLine
+			ELSE
+				FOR i := 0 TO sysCom.communications.Length()-1 DO
+					comm := sysCom.communications.GetSystemCommunication(i);
+					CloseCommunication(SYSTEM.ADR(comm.buffer), Concurrency.CurrentProcess());
+					sysCom.communications.Remove(comm);
+					comm.Free; DELETE(comm)
+				END;
+				sysCom.finalizing := TRUE;
+				ReleaseLock;
+				FinalizeComponent(sysCom.component);
+				DeleteComponent(sysCom.component, Concurrency.CurrentProcess());
+				AcquireLock;
+				systemComponents.Remove(sysCom);
+				sysCom.Free; DELETE(sysCom);
+				ReleaseLock;
+				Basic.OutText("Component "); Basic.OutText(name);
+				Basic.OutText(" deleted"); Basic.OutLine
+			END
+		ELSE
+			ReleaseLock;
+			Basic.OutText("Component "); Basic.OutText(name);
+			Basic.OutText(" not existent"); Basic.OutLine
+		END
+	END ExecuteDeleteComponent;
+	
+	PROCEDURE ExecuteConnectComponents(fromInstance, toInstance: ARRAY OF CHAR; 
+		interface: InterfaceSpecification; fromIndex: LONGINT);
+	VAR fromCom, toCom: SystemComponent; fromDecl, toDecl: InterfaceDeclaration; fromConn, toConn: Address; 
+		flag: SHORTINT;
+	BEGIN	
+		AcquireLock;
+		fromCom := systemComponents.FindSystemComponent(fromInstance);
+		toCom := systemComponents.FindSystemComponent(toInstance);
+		ReleaseLock;
+		IF (fromCom # NIL) & (toCom # NIL) THEN
+			fromDecl := fromCom.template.requiredInterfaces.FindInterfaceDeclaration(interface);
+			toDecl := toCom.template.offeredInterfaces.FindInterfaceDeclaration(interface);
+			IF (fromDecl # NIL) & (toDecl # NIL) THEN
+				ASSERT((toDecl.minNumber = 1) & (toDecl.maxNumber = 1));
+				IF (((fromDecl.minNumber # 1) OR (fromDecl.maxNumber # 1)) & (fromIndex >= 1)) OR 
+					((fromDecl.minNumber = 1) & (fromDecl.maxNumber = 1) & (fromIndex = -1)) THEN
+					fromConn := SelectInterface(fromCom.component, FALSE, interface);
+					toConn := SelectInterface(toCom.component, TRUE, interface);
+					IF (fromDecl.minNumber # 1) OR (fromDecl.maxNumber # 1) THEN
+						fromConn := SelectIndexedConnection(fromConn, fromIndex, Concurrency.CurrentProcess())
+					END;
+					SYSTEM.GET(fromConn + InterfaceConnFlagOffset, flag);
+					IF flag = ConnectionFlagNone THEN
+						Connect(fromConn, toConn, Concurrency.CurrentProcess())
+					ELSE	
+						Basic.OutText("Interface is already connected"); Basic.OutLine
+					END
+				ELSE
+					Basic.OutText("Wrong index of required interface "); Basic.OutLine
+				END
+			ELSE
+				IF fromDecl = NIL THEN 
+					Basic.OutText("Interface "); Basic.OutText(interface.name^); 
+					Basic.OutText(" not required by "); Basic.OutText(fromInstance); Basic.OutLine
+				END;
+				IF toDecl = NIL THEN
+					Basic.OutText("Interface "); Basic.OutText(interface.name^);
+					Basic.OutText(" not offered by"); Basic.OutText(toInstance); Basic.OutLine
+				END
+			END
+		ELSE
+			IF fromCom = NIL THEN 
+				Basic.OutText("Component "); Basic.OutText(fromInstance); 
+				Basic.OutText(" not existent"); Basic.OutLine
+			END;
+			IF toCom = NIL THEN
+				Basic.OutText("Component "); Basic.OutText(toInstance);
+				Basic.OutText(" not existent"); Basic.OutLine
+			END
+		END
+	END ExecuteConnectComponents;
+	
+	PROCEDURE ExecuteDisconnect(instance: ARRAY OF CHAR; interface: InterfaceSpecification; index: LONGINT);
+	VAR com: SystemComponent; decl: InterfaceDeclaration; conn: Address;
+	BEGIN
+		AcquireLock;
+		com := systemComponents.FindSystemComponent(instance);
+		ReleaseLock;
+		IF com # NIL THEN
+			decl := com.template.requiredInterfaces.FindInterfaceDeclaration(interface);
+			IF decl # NIL THEN
+				IF (((decl.minNumber # 1) OR (decl.maxNumber # 1)) & (index >= 1)) OR 
+					((decl.minNumber = 1) & (decl.maxNumber = 1) & (index = -1)) THEN
+					conn := SelectInterface(com.component, FALSE, interface);
+					IF (decl.minNumber # 1) OR (decl.maxNumber # 1) THEN
+						conn := SelectIndexedConnection(conn, index, Concurrency.CurrentProcess())
+					END;
+					Disconnect(conn, Concurrency.CurrentProcess())
+				ELSE
+					Basic.OutText("Wrong interface index"); Basic.OutLine
+				END
+			ELSE
+				Basic.OutText("Interface "); Basic.OutText(interface.name^);
+				Basic.OutText(" not required by "); Basic.OutText(instance); Basic.OutLine
+			END
+		ELSE
+			Basic.OutText("Component "); Basic.OutText(instance); 
+			Basic.OutText(" not existent"); Basic.OutLine
+		END
+	END ExecuteDisconnect;
+	
+	PROCEDURE ExecuteMessageTransmission(isSend: BOOLEAN; instance: ARRAY OF CHAR; interface: InterfaceSpecification; 
+		message: MessageDeclaration; sendParameters: ParameterList);
+	VAR sysCom: SystemComponent; messageIndex, idx: LONGINT; intDecl: InterfaceDeclaration; comm: SystemCommunication;
+		conn: Address; i: LONGINT; par: Parameter; receiveParameters: ParameterList;
+	BEGIN
+		AcquireLock;
+		sysCom := systemComponents.FindSystemComponent(instance);
+		messageIndex := interface.messageDeclarations.IndexOf(message); 
+		ASSERT(messageIndex >= 0);
+		IF sysCom # NIL THEN
+			intDecl := sysCom.template.offeredInterfaces.FindInterfaceDeclaration(interface);
+			IF (intDecl # NIL) & (intDecl.minNumber = 1) & (intDecl.maxNumber = 1) THEN
+				comm := sysCom.communications.FindSystemCommunication(intDecl); 
+				IF comm = NIL THEN
+					conn := SelectInterface(sysCom.component, TRUE, interface);
+					NEW(comm, intDecl); sysCom.communications.Add(comm); comm.buffer := NilValue;
+					ReleaseLock;
+					OpenCommunication(conn, comm.buffer, Concurrency.CurrentProcess())
+				ELSE
+					ReleaseLock
+				END;
+				IF comm.buffer # NilValue THEN
+					IF isSend THEN
+						Send(comm.buffer, Concurrency.CurrentProcess(), messageIndex, sendParameters)
+					ELSE
+						idx := InputMessage(comm.buffer, Concurrency.CurrentProcess());
+						IF idx = messageIndex THEN
+							Receive(comm.buffer, Concurrency.CurrentProcess(), messageIndex, receiveParameters);
+							Basic.OutText("Message "); Basic.OutText(message.name^);
+							IF receiveParameters.Length() > 0 THEN Basic.OutText("(") END;
+							FOR i := 0 TO receiveParameters.Length()-1 DO
+								IF i > 0 THEN Basic.OutText(", ") END;
+								par := receiveParameters.GetParameter(i);
+								IF par IS IntegerParameter THEN
+									Basic.OutInteger(par(IntegerParameter).value)
+								ELSIF par IS RealParameter THEN
+									Basic.OutReal(par(RealParameter).value)
+								ELSIF par IS TextParameter THEN
+									Basic.OutCharacter(22X); Basic.OutText(par(TextParameter).value^); Basic.OutCharacter(22X)
+								ELSIF par IS CharacterParameter THEN
+									Basic.OutCharacter(22X); Basic.OutCharacter(par(CharacterParameter).value); Basic.OutCharacter(22X)
+								ELSE HALT(111)
+								END
+							END;
+							IF receiveParameters.Length() > 0 THEN Basic.OutText(")") END;
+							Basic.OutText(" received"); Basic.OutLine;
+							par := NIL; receiveParameters.Free; DELETE(receiveParameters)
+						ELSIF idx = NoMessage THEN
+							Basic.OutText("No message available"); Basic.OutLine
+						ELSE
+							Basic.OutText("Other message available"); Basic.OutLine
+						END
+					END;
+					IF CanBeFinished(comm.buffer, interface) THEN
+						AcquireLock;
+						sysCom.communications.Remove(comm);
+						ReleaseLock;
+						CloseCommunication(SYSTEM.ADR(comm.buffer), Concurrency.CurrentProcess());
+						comm.Free; DELETE(comm);
+					END
+				END;
+			ELSE
+				ReleaseLock;
+				Basic.OutText("Interface "); Basic.OutText(interface.name^); Basic.OutText(" not offered by "); 
+				Basic.OutText(instance); Basic.OutLine
+			END
+		ELSE 
+			ReleaseLock;
+			Basic.OutText("Component "); Basic.OutText(instance); Basic.OutText(" not existent"); Basic.OutLine
+		END
+	END ExecuteMessageTransmission;
+			
+	PROCEDURE ExecuteTask(taskAdr: Address);
+	VAR task {UNTRACED}: SystemTask; createTask: CreateComponentTask; deleteTask: DeleteComponentTask;
+		connectTask: ConnectComponentsTask; disconnectTask: DisconnectTask;
+		sendTask: SendMessageTask; receiveTask: ReceiveMessageTask;
+	BEGIN
+		task := SYSTEM.VAL(SystemTask, taskAdr);
+		IF task IS CreateComponentTask THEN
+			createTask := task(CreateComponentTask);
+			ExecuteCreateComponent(createTask.name^, createTask.template);
+			createTask := NIL
+		ELSIF task IS DeleteComponentTask THEN
+			deleteTask := task(DeleteComponentTask);
+			ExecuteDeleteComponent(deleteTask.name^);
+			deleteTask := NIL
+		ELSIF task IS ConnectComponentsTask THEN
+			connectTask := task(ConnectComponentsTask);
+			ExecuteConnectComponents(connectTask.fromInstance^, connectTask.toInstance^, 
+				connectTask.interface, connectTask.fromIndex);
+			connectTask := NIL
+		ELSIF task IS DisconnectTask THEN
+			disconnectTask := task(DisconnectTask);
+			ExecuteDisconnect(disconnectTask.instance^, disconnectTask.interface, disconnectTask.index);
+			disconnectTask := NIL
+		ELSIF task IS SendMessageTask THEN
+			sendTask := task(SendMessageTask);
+			ExecuteMessageTransmission(TRUE, sendTask.instance^, sendTask.interface, sendTask.message, sendTask.parameters);
+			sendTask := NIL
+		ELSIF task IS ReceiveMessageTask THEN
+			receiveTask := task(ReceiveMessageTask);
+			ExecuteMessageTransmission(FALSE, receiveTask.instance^, receiveTask.interface, receiveTask.message, NIL);
+			receiveTask := NIL
+		ELSE HALT(111)
+		END;
+		task.Free; DELETE(task)
+	END ExecuteTask;
+	
+	PROCEDURE StartSystemTask*(task: SystemTask);
+	BEGIN Concurrency.NewProcess(Concurrency.SystemStackSize, ExecuteTask, SYSTEM.VAL(Address, task), TRUE)
+	END StartSystemTask;
+	
+	PROCEDURE ShowResources*;
+	VAR nofComs, nofProcs, nofTexts, nofCollections: LONGINT;
+	BEGIN
+		nofComs := Basic.statistics.nofComponents; nofProcs := Basic.statistics.nofProcesses;
+		nofTexts := Basic.statistics.nofTexts; nofCollections := Basic.statistics.nofCollections;
+		Basic.OutText("Resources: "); Basic.OutLine;
+		Basic.OutText(" "); Basic.OutInteger(nofComs); Basic.OutText(" component"); 
+		IF nofComs # 1 THEN Basic.OutText("s") END; Basic.OutLine;
+		Basic.OutText(" "); Basic.OutInteger(nofProcs); Basic.OutText(" process");
+		IF nofProcs # 1 THEN Basic.OutText("es") END; Basic.OutLine;
+		Basic.OutText(" "); Basic.OutInteger(nofTexts); Basic.OutText(" text");
+		IF nofTexts # 1 THEN Basic.OutText("s") END; Basic.OutLine;
+		Basic.OutText(" "); Basic.OutInteger(nofCollections); Basic.OutText(" collection");
+		IF nofCollections # 1 THEN Basic.OutText("s") END; Basic.OutLine; 
+		Basic.OutText(" "); Basic.OutInteger(Processors.nofProcessors); Basic.OutText(" processor"); 
+		IF Processors.nofProcessors > 1 THEN Basic.OutText("s") END;
+		Basic.OutText(" ("); Basic.OutInteger(Processors.nofProcessors - Concurrency.halted);
+		Basic.OutText(" busy)"); Basic.OutLine;
+		Basic.OutText(" "); Basic.OutCardinal(Heap.freeSize DIV Memory.MB); Basic.OutText(" MB "); 
+		Basic.OutCardinal(Heap.freeSize MOD Memory.MB DIV Memory.KB); Basic.OutText(" KB free memory"); 
+		Basic.OutLine
+	END ShowResources;
+	
+	PROCEDURE ShowComponents*;
+	VAR i: LONGINT; sysCom: SystemComponent;
+	BEGIN
+		AcquireLock;
+		Basic.OutText("Components: "); Basic.OutLine;
+		FOR i := 0 TO systemComponents.Length()-1 DO
+			sysCom := systemComponents.GetSystemComponent(i);
+			Basic.OutText(" "); Basic.OutText(sysCom.name^); Basic.OutText(": "); 
+			Basic.OutText(sysCom.template.name^); 
+			Basic.OutLine
+		END;
+		ReleaseLock
+	END ShowComponents;
+										
+	PROCEDURE -CheckAwaitCondition(ebp, pc: Address): BOOLEAN;
+	CODE {SYSTEM.i386}
+		POP EAX (* pc *)
+		(* ebp remains as parameter on stack *)
+		CALL EAX
+		(* result in AL, ebp removed by callee *)
+	END CheckAwaitCondition;
+							
+	PROCEDURE SignalPassiveProcesses(component: Address);
+	VAR syncCom, first: Address; currentTime, nextTime, localCount, waitCount, totalCount, passiveCount: LONGINT; 
+	BEGIN
+		AssertComponentLock(component);
+		SYSTEM.GET(component + ComponentLocalProcCounterOffset, localCount);
+		SYSTEM.GET(component + ComponentLocalWaitCounterOffset, waitCount);
+		ASSERT(waitCount <= localCount);
+		IF localCount = waitCount THEN
+			SignalAwaitingProcesses(component);
+			syncCom := TimeSyncComponent(component);
+			AssertComponentLock(syncCom); 
+			SYSTEM.GET(syncCom + ComponentSyncProcCounterOffset, totalCount);
+			SYSTEM.GET(syncCom + ComponentPassiveCounterOffset, passiveCount);
+			ASSERT(passiveCount <= totalCount);
+			IF passiveCount = totalCount THEN
+				SortPassiveProcesses(syncCom);
+				SYSTEM.GET(syncCom + ComponentVirtualTimeOffset, currentTime);
+				SYSTEM.GET(syncCom + ComponentPassiveSortedOffset + ProcessListFirstOffset, first);
+				IF first # NilValue THEN
+					SYSTEM.GET(first + ProcessNextTimeOffset, nextTime); ASSERT(nextTime > currentTime);
+					SYSTEM.PUT32(syncCom + ComponentVirtualTimeOffset, nextTime);
+					WHILE (first # NilValue) & (SYSTEM.GET32(first + ProcessNextTimeOffset) = nextTime) DO
+						DEC(passiveCount);
+						SYSTEM.PUT32(first + ProcessNextTimeOffset, 0);
+						Concurrency.RemoveProcessFromList(syncCom + ComponentPassiveSortedOffset, first);
+						Concurrency.SetReady(first);
+						SYSTEM.GET(syncCom + ComponentPassiveSortedOffset + ProcessListFirstOffset, first)
+					END;
+					SYSTEM.PUT32(syncCom + ComponentPassiveCounterOffset, passiveCount)
+				END
+			END
+		END
+	END SignalPassiveProcesses;
+	
+	PROCEDURE SortPassiveProcesses(component: Address);
+	VAR count, k, time1, time2: LONGINT; process1, process2: Address; array: ProcessArray; backup: Address;
+	BEGIN
+		SYSTEM.GET(component + ComponentPassiveUnsortedOffset + ProcessListFirstOffset, process1);
+		count := 0;
+		WHILE process1 # NilValue DO 
+			SYSTEM.GET(process1 + ProcessNextProcessOffset, process1); INC(count);
+		END;
+		IF count > 0 THEN
+			NEW(array, count);
+			SYSTEM.GET(component + ComponentPassiveUnsortedOffset + ProcessListFirstOffset, process1);
+			k := 0;
+			WHILE process1 # NilValue DO 
+				array[k] := process1; SYSTEM.GET(process1 + ProcessNextProcessOffset, process1); INC(k)
+			END;
+			Concurrency.InitializeProcessList(component + ComponentPassiveUnsortedOffset);
+			Concurrency.SwitchToSystemStack(backup);
+			QuickSort(array, 0, count-1);
+			Concurrency.ReturnFromSystemStack(backup);
+			k := 0; SYSTEM.GET(component + ComponentPassiveSortedOffset + ProcessListFirstOffset, process2);
+			WHILE k < count DO
+				process1 := array[k];
+				SYSTEM.GET(process1 + ProcessNextTimeOffset, time1);
+				IF process2 # NilValue THEN SYSTEM.GET(process2 + ProcessNextTimeOffset, time2) END;
+				WHILE (process2 # NilValue) & (time1 > time2) DO 
+					SYSTEM.GET(process2 + ProcessNextProcessOffset, process2); 
+					IF process2 # NilValue THEN SYSTEM.GET(process2 + ProcessNextTimeOffset, time2) END
+				END;
+				AddProcessBefore(component + ComponentPassiveSortedOffset, process1, process2);
+				INC(k)
+			END;
+			DELETE(array)
+		END
+	END SortPassiveProcesses;
+		
+	PROCEDURE AddProcessBefore(listAdr: Address; insertProcess, afterProcess: Address);
+	VAR prev: Address;
+	BEGIN
+		IF afterProcess = NilValue THEN
+			SYSTEM.GET(listAdr + ProcessListLastOffset, prev)
+		ELSE
+			SYSTEM.GET(afterProcess + ProcessPrevProcessOffset, prev)
+		END;
+		SYSTEM.PUT32(insertProcess + ProcessPrevProcessOffset, prev);
+		IF prev = NilValue THEN
+			SYSTEM.PUT32(listAdr + ProcessListFirstOffset, insertProcess)
+		ELSE
+			SYSTEM.PUT32(prev + ProcessNextProcessOffset, insertProcess)
+		END;
+		SYSTEM.PUT32(insertProcess + ProcessNextProcessOffset, afterProcess);
+		IF afterProcess = NilValue THEN
+			SYSTEM.PUT32(listAdr + ProcessListLastOffset, insertProcess)
+		ELSE
+			SYSTEM.PUT32(afterProcess + ProcessPrevProcessOffset, insertProcess)
+		END
+	END AddProcessBefore;
+	
+	PROCEDURE QuickSort(a: ProcessArray; L, R: LONGINT);
+	VAR i, j, m: LONGINT; t: Address;
+	BEGIN
+		i := L; j := R; SYSTEM.GET(a[(L+R) DIV 2] + ProcessNextTimeOffset, m);
+		REPEAT
+			WHILE SYSTEM.GET32(a[i] + ProcessNextTimeOffset) < m DO INC(i) END;
+			WHILE SYSTEM.GET32(a[j] + ProcessNextTimeOffset) > m DO DEC(j) END;
+			IF i <= j THEN
+				t := a[i]; a[i] := a[j]; a[j] := t;
+				INC(i); DEC(j)
+			END
+		UNTIL i > j;
+		IF j > L THEN QuickSort(a, L, j) END;
+		IF i < R THEN QuickSort(a, i, R) END;
+	END QuickSort;
+					
+	PROCEDURE SignalAwaitingProcesses(component: Address);
+	VAR syncCom, current, follow, awaitEBP, awaitPC: Address; lockCounter: LONGINT; awaitExclusive: BOOLEAN;
+	BEGIN
+		AssertComponentLock(component);
+		syncCom := TimeSyncComponent(component);
+		AssertComponentLock(syncCom);
+		SYSTEM.GET(component + ComponentLockCounterOffset, lockCounter);
+		IF lockCounter # ExclusiveLock THEN
+			IF AwaitForwardTraversion THEN
+				SYSTEM.GET(component + ComponentAwaitListOffset + ProcessListFirstOffset, current)
+			ELSE (* reverse traversion is by 40% faster *)
+				SYSTEM.GET(component + ComponentAwaitListOffset + ProcessListLastOffset, current)
+			END;
+			WHILE current # NilValue DO
+				(* remember previous / next because current may be removed from this list *)
+				IF AwaitForwardTraversion THEN
+					SYSTEM.GET(current + ProcessNextProcessOffset, follow)
+				ELSE
+					SYSTEM.GET(current + ProcessPrevProcessOffset, follow)
+				END;
+				SYSTEM.GET(current + ProcessAwaitLockOffset, awaitExclusive);
+				SYSTEM.GET(current + ProcessAwaitEBPOffset, awaitEBP);
+				SYSTEM.GET(current + ProcessAwaitPCOffset, awaitPC);
+				IF (((lockCounter = NoLock) & awaitExclusive) OR ((lockCounter # ExclusiveLock) & ~awaitExclusive)) &
+					 	CheckAwaitCondition(awaitEBP, awaitPC) THEN
+					IF awaitExclusive THEN
+						SYSTEM.PUT32(component + ComponentLockCounterOffset, ExclusiveLock)
+					ELSE
+						Basic.IncreaseByAddress(component + ComponentLockCounterOffset)
+					END;					
+					Basic.DecreaseByAddress(syncCom + ComponentPassiveCounterOffset);
+					
+					Concurrency.RemoveProcessFromList(component + ComponentAwaitListOffset, current);
+					Concurrency.SetReady(current);
+					
+					IF awaitExclusive THEN current := NilValue ELSE current := follow END;
+					SYSTEM.GET(component + ComponentLockCounterOffset, lockCounter)
+				ELSE current := follow
+				END
+			END
+		END
+	END SignalAwaitingProcesses;
+	
+	PROCEDURE SignalLockedProcesses(component: Address);
+	VAR process: Address; lockCounter: LONGINT; exclusive, continue: BOOLEAN;
+	BEGIN
+		AssertComponentLock(component);
+		SYSTEM.GET(component + ComponentLockCounterOffset, lockCounter);
+		IF lockCounter # ExclusiveLock THEN
+			REPEAT
+				continue := FALSE;
+				SYSTEM.GET(component + ComponentLockListOffset + ProcessListFirstOffset, process);
+				IF process # NilValue THEN
+					SYSTEM.GET(process + ProcessAwaitLockOffset, exclusive);
+					IF (exclusive & (lockCounter = NoLock)) OR (~exclusive & (lockCounter # ExclusiveLock)) THEN
+						IF exclusive THEN lockCounter := ExclusiveLock
+						ELSE INC(lockCounter); continue := TRUE
+						END;
+						SYSTEM.PUT32(component + ComponentLockCounterOffset, lockCounter);
+						Concurrency.RemoveProcessFromList(component + ComponentLockListOffset, process);
+						Concurrency.SetReady(process)
+					END
+				END
+			UNTIL ~continue
+		END
+	END SignalLockedProcesses;
+				
+	PROCEDURE Lock*(process: Address; exclusiveLock: BOOLEAN);
+	VAR component: Address;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		AcquireComponent2(component, process);
+		IF (exclusiveLock & (SYSTEM.GET32(component + ComponentLockCounterOffset) # NoLock)) OR 
+				(~exclusiveLock & (SYSTEM.GET32(component + ComponentLockCounterOffset) = ExclusiveLock)) THEN
+			SYSTEM.PUT8(process + ProcessAwaitLockOffset, exclusiveLock);
+			Concurrency.AddProcessToList(component + ComponentLockListOffset, process);
+			Concurrency.SuspendWaiting(process, ReleaseComponent, component);
+			(* lock directly obtained by releasing process *)
+		ELSE
+			IF exclusiveLock THEN 
+				SYSTEM.PUT32(component + ComponentLockCounterOffset, ExclusiveLock)
+			ELSE
+				Basic.IncreaseByAddress(component + ComponentLockCounterOffset)
+			END;
+			ReleaseComponent(component)
+		END
+	END Lock;
+	
+	PROCEDURE Unlock*(process: Address; exclusiveLock: BOOLEAN);
+	VAR component, syncCom: Address;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		AcquireComponent2(component, process);
+		IF exclusiveLock THEN
+			syncCom := TimeSyncComponent(component);
+			IF component # syncCom THEN AcquireComponent0(syncCom) END;
+			SYSTEM.PUT32(component + ComponentLockCounterOffset, NoLock);
+			SignalAwaitingProcesses(component);
+			IF component # syncCom THEN ReleaseComponent(syncCom) END
+		ELSE
+			Basic.DecreaseByAddress(component + ComponentLockCounterOffset)
+		END;
+		(* eggshell model: 1. await, 2. exclusive & shared *)
+		SignalLockedProcesses(component);
+		ReleaseComponent(component)
+	END Unlock;
+	
+	PROCEDURE Await*(process: Address; exclusiveLock: BOOLEAN; awaitEBP, awaitPC: Address);
+	VAR component, syncCom: Address;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		syncCom := TimeSyncComponent(component);
+		AcquireComponent2(component, process);
+		IF exclusiveLock THEN
+			SYSTEM.PUT32(component + ComponentLockCounterOffset, NoLock)
+			(* signal from AWAIT to other AWAIT will be handled by SignalPassiveProcesses *)
+		ELSE
+			Basic.DecreaseByAddress(component + ComponentLockCounterOffset)
+		END;
+		SignalLockedProcesses(component);
+		syncCom := TimeSyncComponent(component);
+		SYSTEM.PUT8(process + ProcessAwaitLockOffset, exclusiveLock);
+		SYSTEM.PUT32(process + ProcessAwaitEBPOffset, awaitEBP);
+		SYSTEM.PUT32(process + ProcessAwaitPCOffset, awaitPC);
+		IF component # syncCom THEN AcquireComponent0(syncCom) END;
+		Basic.IncreaseByAddress(syncCom + ComponentPassiveCounterOffset);
+		Basic.IncreaseByAddress(component + ComponentLocalWaitCounterOffset);
+		SignalPassiveProcesses(component);
+		IF component # syncCom THEN ReleaseComponent(syncCom) END;
+		Concurrency.AddProcessToList(component + ComponentAwaitListOffset, process);
+		
+		Concurrency.SuspendWaiting(process, ReleaseComponent, component);
+			
+		AcquireComponent(component);
+		Basic.DecreaseByAddress(component + ComponentLocalWaitCounterOffset);
+		ReleaseComponent(component)
+	END Await;
+			
+	PROCEDURE Passivate*(process: Address; duration: LONGINT; lockType: SHORTINT);
+	VAR component, syncCom: Address; time: LONGINT; 
+	BEGIN
+		ASSERT(duration >= 0);
+		IF duration # 0 THEN
+			SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+			syncCom := TimeSyncComponent(component);
+			AcquireComponent2(component, process);
+			IF component # syncCom THEN AcquireComponent0(syncCom) END;
+			IF lockType # NoLock THEN
+				IF lockType = ExclusiveLock THEN
+					SYSTEM.PUT32(component + ComponentLockCounterOffset, NoLock)
+					(* signal from AWAIT to other AWAIT will be handled by SignalPassiveProcesses *)
+				ELSE 
+					Basic.DecreaseByAddress(component + ComponentLockCounterOffset)
+				END;
+				SignalLockedProcesses(component)
+			END;
+			SYSTEM.GET(syncCom + ComponentVirtualTimeOffset, time); INC(time, duration);
+			SYSTEM.PUT32(process + ProcessNextTimeOffset, time);
+			Basic.IncreaseByAddress(syncCom + ComponentPassiveCounterOffset);
+			Basic.IncreaseByAddress(component + ComponentLocalWaitCounterOffset);
+			Concurrency.AddProcessToList(syncCom + ComponentPassiveUnsortedOffset, process);
+			Concurrency.SuspendWaiting(process, SignalPassiveAndReleaseCom, component);
+			
+			AcquireComponent2(component, process);
+			Basic.DecreaseByAddress(component + ComponentLocalWaitCounterOffset);
+			ReleaseComponent(component);
+			IF lockType # NoLock THEN
+				Lock(process, lockType = ExclusiveLock)
+			END
+		END
+	END Passivate;
+		
+	PROCEDURE SignalPassiveAndReleaseCom(component: Address);
+	VAR syncCom: Address;
+	BEGIN
+		syncCom := TimeSyncComponent(component);
+		SignalPassiveProcesses(component);
+		IF component # syncCom THEN ReleaseComponent(syncCom) END;
+		ReleaseComponent(component)
+	END SignalPassiveAndReleaseCom;
+	
+	PROCEDURE SetPassive(process: Address);
+	VAR component, syncCom: Address;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		syncCom := TimeSyncComponent(component);
+		AcquireComponent(component);
+		IF component # syncCom THEN AcquireComponent0(syncCom) END;
+		Basic.IncreaseByAddress(syncCom + ComponentPassiveCounterOffset);
+		Basic.IncreaseByAddress(component + ComponentLocalWaitCounterOffset);
+		SignalPassiveProcesses(component);
+		IF component # syncCom THEN ReleaseComponent(syncCom) END;
+		ReleaseComponent(component)
+	END SetPassive;
+	
+	PROCEDURE SetActive(process: Address);
+	VAR component, syncCom: Address;
+	BEGIN
+		SYSTEM.GET(process + ProcessHeaderCompOffset, component);
+		syncCom := TimeSyncComponent(component);
+		AcquireComponent(component);
+		IF component # syncCom THEN AcquireComponent0(syncCom) END;
+		Basic.DecreaseByAddress(syncCom + ComponentPassiveCounterOffset);
+		Basic.DecreaseByAddress(component + ComponentLocalWaitCounterOffset);
+		IF component # syncCom THEN ReleaseComponent(syncCom) END;
+		ReleaseComponent(component)
+	END SetActive;
+	
+	PROCEDURE VirtualTime*(component: Address): LONGINT;
+	VAR syncCom: Address; time: LONGINT;
+	BEGIN
+		syncCom := TimeSyncComponent(component);
+		SYSTEM.GET(syncCom + ComponentVirtualTimeOffset, time);
+		RETURN time
+	END VirtualTime;
+	
+	PROCEDURE TimeSyncComponent(component: Address): Address;
+	VAR synchronized: BOOLEAN;
+	BEGIN
+		SYSTEM.GET(component + ComponentSynchronizedOffset, synchronized);
+		WHILE synchronized DO
+			SYSTEM.GET(component + ComponentSuperComOffset, component); 
+			ASSERT(component # NilValue);
+			SYSTEM.GET(component + ComponentSynchronizedOffset, synchronized);
+		END;
+		RETURN component
+	END TimeSyncComponent;
+														
+	PROCEDURE NewBlock(size: LONGINT): Address;
+	VAR adr: Address;
+	BEGIN Heap.New(adr, size); RETURN adr
+	END NewBlock;
+	
+	PROCEDURE DeleteBlock(VAR adr: Address);
+	BEGIN Heap.Delete(adr); adr := NilValue
+	END DeleteBlock;
+			
+	(* spin locks *)
+	PROCEDURE AcquireComponent2(component, currentProcess: Address);
+	BEGIN
+		IF Concurrency.mode # Concurrency.SerialMode THEN
+			WHILE Processors.IsSpinLockedByAdr(component + ComponentSpinLockOffset) DO
+				Concurrency.SuspendReady(currentProcess)
+			END;
+			AcquireComponent(component)
+		END
+	END AcquireComponent2;
+	
+	PROCEDURE AcquireComponent0(component: Address);
+	CONST SyncCost = 50;
+	BEGIN
+		IF Concurrency.mode # Concurrency.SerialMode THEN
+			IF Processors.IsSpinLockedByAdr(component + ComponentSpinLockOffset) THEN
+				INC(Concurrency.syncPerTick, SyncCost)
+			END;
+			AcquireComponent(component)
+		END
+	END AcquireComponent0;
+	
+	PROCEDURE AcquireComponent(component: Address);
+	BEGIN 
+		IF Concurrency.mode # Concurrency.SerialMode THEN 
+			Processors.AcquireSpinLockByAdr(component + ComponentSpinLockOffset);
+			INC(Concurrency.syncPerTick)
+		END
+	END AcquireComponent;
+	
+	PROCEDURE ReleaseComponent(component: Address);
+	BEGIN IF Concurrency.mode # Concurrency.SerialMode THEN Processors.ReleaseSpinLockByAdr(component + ComponentSpinLockOffset) END
+	END ReleaseComponent;
+	
+	PROCEDURE AssertComponentLock(component: Address);
+	BEGIN 
+		IF Concurrency.mode # Concurrency.SerialMode THEN ASSERT(Processors.IsSpinLockedByAdr(component + ComponentSpinLockOffset)) END
+	END AssertComponentLock; 
+		
+	PROCEDURE AcquireBuffer(buffer: Address);
+	BEGIN 
+		IF Concurrency.mode # Concurrency.SerialMode THEN
+			Processors.AcquireSpinLockByAdr(buffer + CommunicationSpinLockOffset);
+			INC(Concurrency.syncPerTick)
+		END
+	END AcquireBuffer;
+	
+	PROCEDURE ReleaseBuffer(buffer: Address);
+	BEGIN IF Concurrency.mode # Concurrency.SerialMode THEN Processors.ReleaseSpinLockByAdr(buffer + CommunicationSpinLockOffset) END
+	END ReleaseBuffer;
+	
+	PROCEDURE AssertBufferLock(buffer: Address);
+	BEGIN IF Concurrency.mode # Concurrency.SerialMode THEN ASSERT(Processors.IsSpinLockedByAdr(buffer + CommunicationSpinLockOffset)) END
+	END AssertBufferLock;
+			
+	PROCEDURE -GetFromStack(offset: LONGINT): Address;
+	CODE {SYSTEM.i386}
+		POP EAX (* offset *)
+		ADD EAX, EBP (* EBP + offset *)
+		MOV EAX, 0[EAX] (* RETURN [EBP + offset] *)
+	END GetFromStack;
+	
+	PROCEDURE -Call(arg0: Address; code: Address);
+	CODE {SYSTEM.i386}
+		POP EAX
+		CALL EAX
+	END Call;
+	
+	PROCEDURE -CallWithResult(arg0: Address; code: Address): Address;
+	CODE {SYSTEM.i386}
+		POP EAX
+		CALL EAX
+	END CallWithResult;
+			
+	PROCEDURE InstallPreemptionTimer;
+	BEGIN Interrupts.InstallInterruptHandler(Interrupts.IRQ0, PreemptionInterrupt)
+	END InstallPreemptionTimer;
+	
+	PROCEDURE InstallTrapHandler;
+	BEGIN 
+		Interrupts.InstallInterruptHandler(Interrupts.GP, TrapHandler);
+		Interrupts.InstallInterruptHandler(Interrupts.BP, TrapHandler)
+	END InstallTrapHandler;
+	
+	PROCEDURE PreemptionInterrupt(VAR state: Interrupts.InterruptState);
+	BEGIN IF Interrupts.timerTicks MOD PreemptionIntervall = 0 THEN SYSTEM.PUTREG(SYSTEM.EDI, 1) END
+	END PreemptionInterrupt;
+	
+	PROCEDURE CreateSystemComponent*;
+	VAR template: ComponentTemplate; offered, required: InterfaceDeclarationList; decl: InterfaceDeclaration; 
+		interface: InterfaceSpecification; size: LONGINT; initAdr, finAdr: Address; task: CreateComponentTask;
+	BEGIN
+		NEW(offered); NEW(required);
+		
+		interface := FindInterfaceSpecification(SystemTimeInterfaceName);
+		IF interface # NIL THEN NEW(decl, SystemTimeInterfaceName, 1, 1); offered.Add(decl) END;
+		
+		interface := FindInterfaceSpecification(FileSystemInterfaceName);
+		IF interface # NIL THEN NEW(decl, FileSystemInterfaceName, 1, 1); offered.Add(decl) END;
+		
+		interface := FindInterfaceSpecification(GraphicViewInterfaceName);
+		IF interface # NIL THEN NEW(decl, GraphicViewInterfaceName, 1, 1); offered. Add(decl) END;
+	
+		size := ComponentHeaderSize + (offered.Length() + required.Length()) * InterfaceConnectionSize;
+		initAdr := SYSTEM.ADR(InitializeSystemComponent); finAdr := SYSTEM.ADR(FinalizeSystemComponent);
+	
+		NEW(template, SystemTemplateName, offered, required, size, initAdr, finAdr);
+		RegisterComponentTemplate(template);
+		NEW(task, SystemComponentName, template); 
+		StartSystemTask(task)
+	END CreateSystemComponent;
+	
+	PROCEDURE InitializeSystemComponent(component: Address);
+	VAR template: ComponentTemplate; decl: InterfaceDeclaration; connAdr, implAdr: Address; i: LONGINT;
+	BEGIN
+		template := componentTemplates.FindComponentTemplate(SystemTemplateName); ASSERT(template # NIL);
+		FOR i := 0 TO template.offeredInterfaces.Length()-1 DO
+			decl := template.offeredInterfaces.GetInterfaceDeclaration(i);
+			connAdr := component + ComponentHeaderSize + (i * InterfaceConnectionSize);
+			ASSERT((decl.minNumber = 1) & (decl.maxNumber = 1));
+			IF decl.name^ = SystemTimeInterfaceName THEN 
+				implAdr := SYSTEM.ADR(SystemTimeImplementation)
+			ELSIF decl.name^ = FileSystemInterfaceName THEN
+				implAdr := SYSTEM.ADR(FileSystemImplementation)
+			ELSIF decl.name^ = GraphicViewInterfaceName THEN
+				implAdr := SYSTEM.ADR(GraphicViewImplementation)
+			ELSE HALT(111)
+			END;
+			SYSTEM.PUT32(connAdr + InterfaceConnReferenceOffset, implAdr);
+			SYSTEM.PUT8(connAdr + InterfaceConnFlagOffset, ConnectionFlagImplemented)
+		END;
+		SYSTEM.PUT8(component + ComponentLifeStateOffset, LifeStateInactive)
+	END InitializeSystemComponent;
+	
+	PROCEDURE FinalizeSystemComponent(component: Address);
+	BEGIN HALT(99) (* not allowed *)
+	END FinalizeSystemComponent;
+	
+	PROCEDURE SystemTimeImplementation(component: Address): Address;
+	CONST StackSize = 2*1024;
+	VAR interface: InterfaceSpecification; bufferAdr: Address;
+	BEGIN
+		interface := FindInterfaceSpecification(SystemTimeInterfaceName); ASSERT(interface # NIL);
+		bufferAdr := CreateSystemServerProcess(component, interface, StackSize, SystemTimeServer);
+		RETURN bufferAdr
+	END SystemTimeImplementation;
+
+	PROCEDURE FileSystemImplementation(component: Address): Address;
+	CONST StackSize = 128*1024;
+	VAR interface: InterfaceSpecification; bufferAdr: Address;
+	BEGIN
+		interface := FindInterfaceSpecification(FileSystemInterfaceName); ASSERT(interface # NIL);
+		bufferAdr := CreateSystemServerProcess(component, interface, StackSize, FileSystemServer);
+		RETURN bufferAdr
+	END FileSystemImplementation;
+	
+	PROCEDURE GraphicViewImplementation(component: Address): Address;
+	CONST StackSize = 2*1024;
+	VAR interface: InterfaceSpecification; bufferAdr: Address;
+	BEGIN
+		interface := FindInterfaceSpecification(GraphicViewInterfaceName); ASSERT(interface # NIL);
+		bufferAdr := CreateSystemServerProcess(component, interface, StackSize, GraphicViewServer);
+		RETURN bufferAdr
+	END GraphicViewImplementation;
+			
+	PROCEDURE CreateSystemServerProcess(component: Address; interface: InterfaceSpecification; stackSize: LONGINT; 
+		server: ServerProcess): Address;
+	CONST VariableSize = 128;
+	VAR size, ebp, esp: LONGINT; codeAdr, bufferAdr, parAdr: Address; process: Address;
+	BEGIN
+		ASSERT(stackSize >= 1024); ASSERT(interface # NIL);
+		size := ProcessReservedSize + VariableSize + stackSize;
+		ebp := size - ProcessTailSize;
+		esp := ebp - 4 - VariableSize;
+		codeAdr := SYSTEM.VAL(Address, server);
+		process := InternalCreateProcess(component, size, ebp, esp, codeAdr, interface); (* not yet started => set initial stack info first *)
+		bufferAdr := process + ebp + ProcessTailCommBufferOffset;
+		InitializeCommunicationBuffer(bufferAdr, interface);		
+		parAdr := process + esp;
+		SYSTEM.PUT32(parAdr + 0, NilValue);
+		SYSTEM.PUT32(parAdr + 4, process);
+		SYSTEM.PUT32(parAdr + 8, component);
+		SYSTEM.PUT32(parAdr + 12, bufferAdr);
+		(* start the process after complete initialization *)
+		Concurrency.SetReady(process); 
+		RETURN bufferAdr
+	END CreateSystemServerProcess;
+	
+	PROCEDURE InitializeCommunicationBuffer*(buffer: Address; interface: InterfaceSpecification);
+	BEGIN
+		SYSTEM.PUT32(buffer + CommunicationInterfaceOffset, interface);
+		SYSTEM.PUT32(buffer + CommunicationSpinLockOffset, Processors.Unlocked);
+		SYSTEM.PUT32(buffer + CommProtocolStateOffset, StartProtocolRow);
+		SYSTEM.PUT32(buffer + CommWaitingProcessOffset, NilValue);
+		SYSTEM.PUT32(buffer + CommSourceConnectionOffset, NilValue);
+		SYSTEM.PUT32(buffer + CommunicationFirstOffset, 0);
+		SYSTEM.PUT32(buffer + CommunicationLastOffset, 0);
+		SYSTEM.PUT32(buffer + CommunicationEntrySizeOffset, CommunicationEntrySize(interface))
+	END InitializeCommunicationBuffer;
+	
+	PROCEDURE SystemTimeServer(buffer: Address; component, process: Address);
+	VAR interface: InterfaceSpecification; messageId: LONGINT; parameters: ParameterList; par: Parameter; ms: LONGINT;
+	BEGIN 
+		interface := FindInterfaceSpecification(SystemTimeInterfaceName); ASSERT(interface # NIL);
+		ReceiveAny(buffer, process, messageId, parameters);
+		IF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("GetSystemTime") THEN
+			messageId := interface.messageDeclarations.IndexOfMessageDeclaration("SystemTime");
+			parameters.Free; DELETE(parameters);
+			NEW(parameters); parameters.AddInteger(SYSTEM.VAL(LONGINT, Interrupts.timerTicks));
+			Send(buffer, process, messageId, parameters);
+			parameters.Free; DELETE(parameters)
+		ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Wait") THEN
+			par := parameters.GetParameter(0); ms := par(IntegerParameter).value;
+			parameters.Free; DELETE(parameters);
+			Concurrency.Wait(ms);
+			messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Passed"); NEW(parameters); 
+			Send(buffer, process, messageId, parameters);
+			parameters.Free; DELETE(parameters)
+		ELSE HALT(111)
+		END;
+		EndServer(buffer, process);
+		DeleteProcess(process);
+		HALT(80) (* not reachable *)
+	END SystemTimeServer;
+	
+	PROCEDURE FileSystemServer(buffer: Address; component, process: Address);
+	VAR interface: InterfaceSpecification; messageId: LONGINT; parameters: ParameterList; 
+		par0: Parameter; filename: Basic.String; position, length: LONGINT;
+		byte: CHAR; line: Basic.String; ok: BOOLEAN; rider: FileSystem.Rider; closed: BOOLEAN;
+	BEGIN
+		interface := FindInterfaceSpecification(FileSystemInterfaceName); ASSERT(interface # NIL);
+		ReceiveAny(buffer, process, messageId, parameters);
+		par0 := parameters.GetParameter(0); filename := par0(TextParameter).value;
+		IF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("New") THEN
+			FileSystem.NewFile(filename^, rider, ok)
+		ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Open") THEN
+			FileSystem.OpenFile(filename^, rider, ok)
+		ELSE HALT(111)
+		END;
+		filename := NIL; par0 := NIL;
+		parameters.Free; DELETE(parameters);
+		closed := FALSE;
+		IF ok THEN
+			messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Done");
+			NEW(parameters);
+			Send(buffer, process, messageId, parameters);
+			parameters.Free; DELETE(parameters);
+			REPEAT
+				ReceiveAny(buffer, process, messageId, parameters);
+				IF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("SetPosition") THEN
+					par0 := parameters.GetParameter(0); position := par0(IntegerParameter).value;
+					FileSystem.SetPosition(rider, position);
+					par0 := NIL; parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("GetPosition") THEN
+					position := FileSystem.Position(rider);
+					messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Position");
+					parameters.Free; DELETE(parameters);
+					NEW(parameters); parameters.AddInteger(position);
+					Send(buffer, process, messageId, parameters);
+					parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("GetLength") THEN
+					length := FileSystem.FileLength(rider);
+					messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Length");
+					parameters.Free; DELETE(parameters);
+					NEW(parameters); parameters.AddInteger(length);
+					Send(buffer, process, messageId, parameters);
+					parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("ReadByte") THEN
+					parameters.Free; DELETE(parameters);
+					FileSystem.Read(rider, byte);
+					IF byte # 0X THEN
+						messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Byte");
+						NEW(parameters); parameters.AddCharacter(byte)
+					ELSE
+						messageId := interface.messageDeclarations.IndexOfMessageDeclaration("EOF");
+						NEW(parameters)
+					END;
+					Send(buffer, process, messageId, parameters);
+					parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("ReadLine") THEN
+					parameters.Free; DELETE(parameters);
+					line := ReadFileLine(rider);
+					IF line # NIL THEN
+						messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Line");
+						NEW(parameters); parameters.AddText(line^);
+						DELETE(line)
+					ELSE
+						messageId := interface.messageDeclarations.IndexOfMessageDeclaration("EOF");
+						NEW(parameters)
+					END;
+					Send(buffer, process, messageId, parameters);
+					parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Write") THEN
+					par0 := parameters.GetParameter(0); byte := par0(CharacterParameter).value;
+					FileSystem.Write(rider, byte);
+					par0 := NIL; parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("WriteText") THEN
+					par0 := parameters.GetParameter(0); line := par0(TextParameter).value;
+					WriteFileLine(rider, line^);
+					line := NIL; par0 := NIL; parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Update") THEN
+					FileSystem.Update(rider);
+					parameters.Free; DELETE(parameters)
+				ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Close") THEN
+					FileSystem.CloseFile(rider); closed := TRUE;
+					parameters.Free; DELETE(parameters)
+				ELSE HALT(111)
+				END
+			UNTIL closed
+		ELSE
+			FileSystem.CloseFile(rider); 
+			messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Failed");
+			NEW(parameters);
+			Send(buffer, process, messageId, parameters);
+			parameters.Free; DELETE(parameters)
+		END;
+		EndServer(buffer, process);
+		DeleteProcess(process);
+		HALT(80) (* unreachable *)
+	END FileSystemServer;
+	
+	PROCEDURE GraphicViewServer(buffer: Address; component, process: Address);
+	TYPE Layer = POINTER TO ARRAY OF Output.Color;
+	CONST MaxLayers = 4; NoLayer = -1; Transparent = -1;
+	VAR interface: InterfaceSpecification; messageId: LONGINT; parameters: ParameterList; par: Parameter;
+		x, y, w, h, color: LONGINT; char: CHAR; entryAdr: Address; layers: ARRAY MaxLayers OF Layer; 
+		currentLayer: LONGINT; i, j, k, p: LONGINT; useLayers: BOOLEAN;
+	BEGIN
+		currentLayer := -1; useLayers := FALSE;
+		interface := FindInterfaceSpecification(GraphicViewInterfaceName); ASSERT(interface # NIL);
+		REPEAT
+			entryAdr := WaitToReceive(buffer, process);
+			messageId := InputMessage(buffer, process);
+			IF messageId # FinishMessage THEN
+				Receive(buffer, process, messageId, parameters)
+			END;
+			IF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Clear") THEN
+				IF currentLayer # NoLayer THEN
+					FOR i := 0 TO LEN(layers[currentLayer])-1 DO layers[currentLayer][i] := Transparent END
+				ELSE
+					Output.ClearView(Output.graphicOutput)
+				END;
+				parameters.Free; DELETE(parameters)
+			ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("GetSize") THEN
+				messageId := interface.messageDeclarations.IndexOfMessageDeclaration("Size"); NEW(parameters); 
+				parameters.AddInteger(Output.graphicOutput.innerWidth); 
+				parameters.AddInteger(Output.graphicOutput.innerHeight);
+				parameters.AddInteger(Output.graphicOutput.backgroundColor);
+				Send(buffer, process, messageId, parameters);
+				parameters.Free; DELETE(parameters)
+			ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Pixel") THEN
+				par := parameters.GetParameter(0); x := par(IntegerParameter).value;
+				par := parameters.GetParameter(1); y := par(IntegerParameter).value;
+				par := parameters.GetParameter(2); color := par(IntegerParameter).value;
+				IF (x >= 0) & (y >= 0) & (x < Output.graphicOutput.innerWidth) & (y < Output.graphicOutput.innerHeight) THEN
+					IF currentLayer # NoLayer THEN
+						layers[currentLayer][y * Output.graphicOutput.innerWidth + x] := color
+					ELSE
+						Output.SetPixel(Output.graphicOutput.innerX + x, Output.graphicOutput.innerY + y, color)
+					END
+				END;
+				par := NIL; parameters.Free; DELETE(parameters)
+			ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Font") THEN
+				par := parameters.GetParameter(0); x := par(IntegerParameter).value;
+				par := parameters.GetParameter(1); y := par(IntegerParameter).value;
+				par := parameters.GetParameter(2); char := par(CharacterParameter).value;
+				par := parameters.GetParameter(3); color := par(IntegerParameter).value;
+				IF (x >= 0) & (y >= 0) & (x + Output.GlyphWidth <= Output.graphicOutput.innerWidth) & 
+						(y + Output.GlyphHeight <= Output.graphicOutput.innerHeight) THEN
+					IF currentLayer # NoLayer THEN
+						k := ORD(char);
+						FOR j := 0 TO Output.GlyphHeight-1 DO
+							FOR i := 0 TO Output.GlyphWidth-1 DO
+								IF Output.glyphs[k][j * Output.GlyphWidth + i] THEN 
+									layers[currentLayer][(y + j) * Output.graphicOutput.innerWidth + x + i] := color
+								END
+							END
+						END
+					ELSE
+						Output.Font(Output.graphicOutput.innerX + x, Output.graphicOutput.innerY + y, char, color)
+					END
+				END;
+				par := NIL; parameters.Free; DELETE(parameters)
+			ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("Fill") THEN
+				par := parameters.GetParameter(0); x := par(IntegerParameter).value;
+				par := parameters.GetParameter(1); y := par(IntegerParameter).value;
+				par := parameters.GetParameter(2); w := par(IntegerParameter).value;
+				par := parameters.GetParameter(3); h := par(IntegerParameter).value;
+				par := parameters.GetParameter(4); color := par(IntegerParameter).value;
+				IF (x >= 0) & (y >= 0) & (w >= 0) & (h >= 0) & 
+						(x + w <= Output.graphicOutput.innerWidth) & (y + h <= Output.graphicOutput.innerHeight) THEN
+					IF currentLayer # NoLayer THEN
+						FOR i := 0 TO w-1 DO
+							FOR j := 0 TO h-1 DO
+								layers[currentLayer][(y + j) * Output.graphicOutput.innerWidth + x + i] := color
+							END
+						END
+					ELSE
+						Output.Fill(Output.graphicOutput.innerX + x, Output.graphicOutput.innerY + y, w, h, color)
+					END
+				END;
+				par := NIL; parameters.Free; DELETE(parameters)
+			ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("SetLayer") THEN
+				par := parameters.GetParameter(0); currentLayer := par(IntegerParameter).value;
+				IF (currentLayer >= 0) & (currentLayer < MaxLayers) THEN
+					IF layers[currentLayer] = NIL THEN
+						NEW(layers[currentLayer], Output.graphicOutput.innerWidth * Output.graphicOutput.innerHeight);
+						FOR i := 0 TO LEN(layers[currentLayer])-1 DO layers[currentLayer][i] := Transparent END;
+						useLayers := TRUE
+					END
+				ELSE
+					currentLayer := NoLayer
+				END;
+				par := NIL; parameters.Free; DELETE(parameters)
+			ELSIF messageId = interface.messageDeclarations.IndexOfMessageDeclaration("DrawLayers") THEN
+				IF useLayers THEN
+					FOR y := 0 TO Output.graphicOutput.innerHeight-1 DO
+						FOR x := 0 TO Output.graphicOutput.innerWidth-1 DO
+							p := Output.graphicOutput.innerWidth * y + x;
+							i := MaxLayers-1; WHILE (i >= 0) & ((layers[i] = NIL) OR (layers[i][p] = Transparent)) DO DEC(i) END;
+							IF i >= 0 THEN 
+								Output.SetPixel(Output.graphicOutput.innerX + x, Output.graphicOutput.innerY + y, layers[i][p])
+							ELSE
+								Output.SetPixel(Output.graphicOutput.innerX + x, Output.graphicOutput.innerY + y, 
+									Output.graphicOutput.backgroundColor)
+							END
+						END
+					END
+				END;
+				par := NIL; parameters.Free; DELETE(parameters)
+			END
+		UNTIL messageId = FinishMessage;
+		FOR i := 0 TO MaxLayers-1 DO
+			IF layers[i] # NIL THEN DELETE(layers[i]) END
+		END;
+		EndServer(buffer, process);
+		DeleteProcess(process);
+		HALT(80) (* unreachable *)
+	END GraphicViewServer;
+	
+	PROCEDURE ReadFileLine(VAR r: FileSystem.Rider): Basic.String;
+	VAR i: LONGINT; s: Basic.String; x: CHAR;
+	BEGIN
+		i := 0; NEW(s, 64);
+		REPEAT
+			FileSystem.Read(r, x); 
+			IF (x # 0X) & (x # 0AX) & (x # 0DX) THEN s[i] := x; INC(i) END;
+			IF i = LEN(s) THEN ExpandString(s) END
+		UNTIL (x = 0X) OR (x = 0AX) OR (x = 0DX);
+		IF x = 0DX THEN 
+			FileSystem.Read(r, x);
+			IF x # 0AX THEN FileSystem.SetPosition(r, FileSystem.Position(r)-1) END
+		END;
+		IF i < LEN(s) THEN s[i] := 0X END;
+		IF (i = 0) & (x = 0X) THEN 
+			DELETE(s);
+			RETURN NIL
+		ELSE RETURN s
+		END
+	END ReadFileLine;
+	
+	PROCEDURE ExpandString(VAR s: Basic.String);
+	VAR old: Basic.String; i: LONGINT;
+	BEGIN
+		old := s; NEW(s, LEN(s) * 2);
+		i := 0; WHILE (i < LEN(old)) & (old[i] # 0X) DO s[i] := old[i]; INC(i) END; s[i] := 0X;
+		DELETE(old)
+	END ExpandString;
+	
+	PROCEDURE WriteFileLine(VAR r: FileSystem.Rider; x: ARRAY OF CHAR);
+	VAR i: LONGINT;
+	BEGIN i := 0; WHILE (i < LEN(x)) & (x[i] # 0X) DO FileSystem.Write(r, x[i]); INC(i) END
+	END WriteFileLine;
+	
+	PROCEDURE WriteFileReal(VAR r: FileSystem.Rider; x: REAL);
+	BEGIN (* not yet implemented *)
+	END WriteFileReal;
+	
+	PROCEDURE WriteFileInteger(VAR r: FileSystem.Rider; x: LONGINT);
+	VAR t: ARRAY 14 OF CHAR;
+	BEGIN Basic.IntegerToText(x, t); WriteFileLine(r, t)
+	END WriteFileInteger;
+	
+	PROCEDURE WriteFileHex(VAR r: FileSystem.Rider; x: LONGINT);
+	VAR t: ARRAY 14 OF CHAR;
+	BEGIN Basic.IntegerToHexText(x, t); WriteFileLine(r, t)
+	END WriteFileHex;
+	
+	PROCEDURE ReceiveAny(buffer: Address; process: Address; VAR messageId: LONGINT; VAR parameters: ParameterList);
+	VAR entryAdr: Address;
+	BEGIN
+		entryAdr := WaitToReceive(buffer, process);
+		messageId := InputMessage(buffer, process);
+		Receive(buffer, process, messageId, parameters)
+	END ReceiveAny;
+	
+	PROCEDURE EndServer(buffer: Address; process: Address);
+	VAR entryAdr: Address; message: LONGINT;
+	BEGIN 
+		entryAdr := WaitToReceive(buffer, process);
+		SYSTEM.GET(entryAdr + CommEntryMessageOffset, message); 
+		ASSERT(message = FinishMessage, 212)
+	END EndServer;
+
+	PROCEDURE CommunicationBufferSize(interface: InterfaceSpecification): LONGINT;
+	BEGIN RETURN CommunicationBufferHeaderSize + CommunicationBufferCapacity * CommunicationEntrySize(interface)
+	END CommunicationBufferSize;
+	
+	PROCEDURE CommunicationEntrySize(interface: InterfaceSpecification): LONGINT;
+	VAR size, temp, i: LONGINT; md: MessageDeclaration; 
+	BEGIN
+		size := 0;
+		FOR i := 0 TO interface.messageDeclarations.Length()-1 DO
+			md := interface.messageDeclarations.GetMessageDeclaration(i);
+			temp := md.parameterTypes.Length() * 4;
+			IF temp > size THEN size := temp END
+		END;
+		INC(size, CommEntryHeaderSize);
+		ASSERT(size >= CommEntryHeaderSize);
+		RETURN size
+	END CommunicationEntrySize;
+	
+	PROCEDURE InitializeStatistics;
+	BEGIN
+		Basic.statistics.nofComponents := 0;
+		Basic.statistics.nofProcesses := 0;
+		Basic.statistics.nofTexts := 0;
+		Basic.statistics.nofCollections := 0
+	END InitializeStatistics;
+	
+	PROCEDURE InitializeLog*;
+	BEGIN IF ~useLog THEN FileSystem.NewFile(LogFileName, log, useLog) END
+	END InitializeLog;
+	
+	PROCEDURE FinalizeLog*;
+	BEGIN IF useLog THEN FileSystem.CloseFile(log); useLog := FALSE END
+	END FinalizeLog;
+	
+	PROCEDURE AcquireLock;
+	BEGIN Concurrency.Lock(lock)
+	END AcquireLock;
+	
+	PROCEDURE ReleaseLock;
+	BEGIN Concurrency.Unlock(lock)
+	END ReleaseLock;
+	
+	PROCEDURE SetSchedulerMode*(mode: Concurrency.SchedulerMode);
+	BEGIN
+		IF (Basic.statistics.nofProcesses = 0) & (Basic.statistics.nofComponents = 1) & Concurrency.ChangeMode(mode) THEN
+			IF mode = Concurrency.SerialMode THEN Basic.OutText("Serial ")
+			ELSIF mode = Concurrency.ParallelMode THEN Basic.OutText("Parallel ")
+			ELSIF mode = Concurrency.SemiParallelMode THEN Basic.OutText("Smart ")
+			ELSE HALT(111)
+			END;
+			Basic.OutText("scheduler activated"); Basic.OutLine
+		ELSE
+			Basic.OutText("Cannot change mode while components are running"); Basic.OutLine
+		END
+	END SetSchedulerMode;
+	
+	PROCEDURE Initialize;
+	VAR i: LONGINT;
+	BEGIN
+		IF Profiling THEN
+			Interrupts.InstallInterruptHandler(Interrupts.IRQ0, TimerHandler);
+		END;
+		Concurrency.InitializeLock(lock);
+		useLog := FALSE; 
+		NEW(componentTemplates); 
+		NEW(interfaceSpecifications);
+		NEW(constList); NEW(codeList);
+		NEW(trapRegions);
+		NEW(systemComponents);
+		InitializeStatistics;
+		InstallPreemptionTimer;
+		inTrap := FALSE;
+		InstallTrapHandler
+	END Initialize;
+		
+	PROCEDURE TimerHandler(VAR state: Interrupts.InterruptState);
+	VAR region: TrapRegion; eip, ebp: Address; k: LONGINT;
+	BEGIN 
+		IF Interrupts.timerTicks MOD 3000 = 0 THEN
+			eip := state.EIP; ebp := state.EBP;
+			Basic.OutCharacter("["); Basic.OutInteger(Processors.ID()); Basic.OutCharacter("]");
+			region := trapRegions.FindTrapRegion(eip);
+			Basic.OutText(" TIMER ");
+			IF region # NIL THEN
+				Basic.OutText(region.name^); Basic.OutText(" pc=");
+				Basic.OutHexCardinal(eip - region.start)
+			ELSE
+				Basic.OutHexCardinal(eip);
+				k := 0;
+				WHILE (ebp # NilValue) & (k < 6) DO
+					SYSTEM.GET(ebp + 4, eip);
+					Basic.OutCharacter(" "); Basic.OutHexCardinal(eip); INC(k);
+					SYSTEM.GET(ebp, ebp)
+				END
+			END; 
+			Basic.OutLine
+		END
+	END TimerHandler;
+	
+	PROCEDURE TrapHandler(VAR state: Interrupts.InterruptState);
+	VAR region: TrapRegion; eip, ebp: Address; 
+	BEGIN
+		Interrupts.InterruptOutput(state);
+		state.EIP := SYSTEM.ADR(Concurrency.ReturnFromTrap);
+		IF ~inTrap THEN
+			inTrap := TRUE;
+			eip := state.EIP; ebp := state.EBP;
+			region := trapRegions.FindTrapRegion(eip); 
+			WHILE (region = NIL) & (ebp # NilValue) DO
+				SYSTEM.GET(ebp + 4, eip); SYSTEM.GET(ebp, ebp);
+				region := trapRegions.FindTrapRegion(eip)
+			END;
+			IF region # NIL THEN
+				Basic.OutText("TRAP "); Basic.OutText(region.name^); Basic.OutText(" pc=");
+				Basic.OutCardinal(eip - region.start); Basic.OutLine
+			END;
+			inTrap := FALSE
+		END
+	END TrapHandler;
+	
+	BEGIN
+		ASSERT(Collections.NilValue = NilValue);
+		ASSERT(Concurrency.NilValue = NilValue);
+		ASSERT(Concurrency.ProcessMinHeaderSize <= ProcessHeaderSize);
+		ASSERT(Concurrency.ProcessBackupPCOffset = ProcessBackupPCOffset);
+		ASSERT(Concurrency.ProcessBackupESPOffset = ProcessBackupESPOffset);
+		ASSERT(Concurrency.ProcessBackupEBPOffset = ProcessBackupEBPOffset);
+		ASSERT(Concurrency.ProcessStackLimitOffset = ProcessStackLimitOffset);
+		ASSERT(Concurrency.ProcessPrevProcessOffset = ProcessPrevProcessOffset);
+		ASSERT(Concurrency.ProcessNextProcessOffset = ProcessNextProcessOffset);
+		
+		Initialize
+END ComRuntime.
+

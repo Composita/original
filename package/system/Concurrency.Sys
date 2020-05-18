@@ -1,0 +1,801 @@
+MODULE Concurrency; (** Kernel, Concurrency Management, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Interrupts, Heap, Memory, Processors;
+	
+	(** 
+		Generic light-weighted concurrency
+		- preexistent standard processes implementation
+		- support of specific process implementations
+		- round robin scheduler 
+		- no specific model of synchronization / wait & signal / preemption prejudiced
+	*)
+	
+	TYPE
+		SchedulerMode* = SHORTINT;
+	CONST
+		SerialMode* = 1;
+		ParallelMode* = 2;
+		SemiParallelMode* = 3;
+		
+		DefaultMode = SemiParallelMode;
+																			
+	TYPE
+		Address* = Memory.Address;
+		
+	CONST
+		NilValue* = Memory.Nil;
+		MaxProcessors* = Processors.MaxProcessors;
+	
+	CONST
+		(** process header layout *)
+		ProcessMinHeaderSize* = 6*4; 
+		ProcessBackupPCOffset* = 0*4;
+		ProcessBackupESPOffset* = 1*4;
+		ProcessBackupEBPOffset* = 2*4;
+		ProcessStackLimitOffset* = 3*4;
+		ProcessPrevProcessOffset* = 4*4; 
+		ProcessNextProcessOffset* = 5*4;
+		
+		(** process list layout *)
+		ProcessListSize* = 2*4;
+		ProcessListFirstOffset* = 0;
+		ProcessListLastOffset* = 4;
+	
+	TYPE
+		ProcessList* = RECORD
+			first, last: Address
+		END;
+									
+		Context = RECORD
+			pc, esp, ebp, stackLimit: Address
+		END;
+
+	CONST
+		SystemStackSize* = 128*1024;
+	
+	TYPE				
+		SystemStack = RECORD
+			stackBlock: Address;
+			inUse: BOOLEAN
+		END;
+			
+	TYPE
+		GenericProcedure* = PROCEDURE(parameter: Address);
+		
+	TYPE
+		WaitLock* = RECORD
+			spinLock: Processors.SpinLock;
+			locked: BOOLEAN;
+			waitingQueue: ProcessList
+		END;
+						
+	(* Concurrency model specific variables *)
+	VAR
+		lock: Processors.SpinLock;
+		mode-: SchedulerMode;
+		parallelReadyList: ProcessList;
+		serialReadyList: ProcessList;
+		serialNewList: ProcessList;
+		priorityList: ProcessList;
+		running: ARRAY MaxProcessors OF Address; (* of process *)
+		systemContext: ARRAY MaxProcessors OF Context;
+		systemStack: ARRAY MaxProcessors OF SystemStack;
+		halted-, waitChange: LONGINT; changeMode: BOOLEAN;
+		
+	CONST MaxSyncPerTick* = 500;
+	VAR syncPerTick*, avgSyncPerTick: CARDINAL;
+				
+	(* Multi-processor specific variables *)
+	VAR
+		MPStarted: BOOLEAN;
+		MPBootLock: LONGINT;
+		pauseLoopRate: CARDINAL; (* for 1ms *)
+						
+	(** Standard process implementation *)
+	PROCEDURE NewProcess*(stackSize: LONGINT; procedure: GenericProcedure; param: Address; highPrio: BOOLEAN);
+	CONST ExtraParamSize = 2*4;
+	VAR process: Address; esp, ebp, pc: Address; size: LONGINT;
+	BEGIN
+		ASSERT(stackSize >= 0); 
+		size := ProcessMinHeaderSize + stackSize + ExtraParamSize;
+		Heap.New(process, size); 
+		esp := process + size - ExtraParamSize; ebp := esp; pc := SYSTEM.VAL(Address, procedure);
+		SYSTEM.PUT32(esp + 0, SYSTEM.ADR(TerminateProcess)); (* return pc *)
+		SYSTEM.PUT32(esp + 4, param); 
+		SYSTEM.PUT32(process + ProcessBackupPCOffset, pc);
+		SYSTEM.PUT32(process + ProcessBackupESPOffset, esp);
+		SYSTEM.PUT32(process + ProcessBackupEBPOffset, ebp);
+		SYSTEM.PUT32(process + ProcessStackLimitOffset, esp - stackSize);
+		SYSTEM.PUT32(process + ProcessPrevProcessOffset, NilValue);
+		SYSTEM.PUT32(process + ProcessNextProcessOffset, NilValue);
+		IF highPrio THEN
+			Processors.AcquireLock(lock);
+			AddProcessToList(SYSTEM.ADR(priorityList), process);
+			Processors.ReleaseLock(lock)
+		ELSE
+			SetReady(process)
+		END
+	END NewProcess;
+	
+	(* linker entry for module initialization sequence *)
+	PROCEDURE TerminateProcess*;
+	VAR process: Address;
+	BEGIN
+		process := CurrentProcess();
+		ReturnToSystemAndExecute(Heap.Delete, process);
+		HALT(80) (* not reachable *)
+	END TerminateProcess;
+	
+	PROCEDURE Wait*(ms: LONGINT);
+	VAR start: CARDINAL;
+	BEGIN
+		start := Interrupts.timerTicks;
+		WHILE Interrupts.timerTicks < start + ms DO 
+			Suspend
+		END
+	END Wait;
+	
+	PROCEDURE Suspend*;
+	BEGIN SuspendReady(CurrentProcess())
+	END Suspend;
+
+	PROCEDURE InitializeLock*(VAR lock: WaitLock);
+	BEGIN 
+		Processors.InitializeLock(lock.spinLock);
+		lock.locked := FALSE;
+		InitializeProcessList(SYSTEM.ADR(lock.waitingQueue))
+	END InitializeLock;
+	
+	PROCEDURE Lock*(VAR lock: WaitLock);
+	VAR process: Address;
+	BEGIN 
+		process := CurrentProcess();
+		Processors.AcquireLock(lock.spinLock);
+		IF lock.locked THEN
+			AddProcessToList(SYSTEM.ADR(lock.waitingQueue), process);
+			SuspendWaiting(process, InternalReleaseSpinLock, SYSTEM.ADR(lock.spinLock));
+			ASSERT(lock.locked)
+		ELSE
+			lock.locked := TRUE;
+			Processors.ReleaseLock(lock.spinLock)
+		END
+	END Lock;
+	
+	PROCEDURE Unlock*(VAR lock: WaitLock);
+	VAR process: Address;
+	BEGIN
+		Processors.AcquireLock(lock.spinLock);
+		ASSERT(lock.locked);
+		process := lock.waitingQueue.first;
+		IF process # NilValue THEN
+			RemoveProcessFromList(SYSTEM.ADR(lock.waitingQueue), process);
+			SetReady(process)
+		ELSE
+			lock.locked := FALSE
+		END;
+		Processors.ReleaseLock(lock.spinLock)
+	END Unlock;
+	
+	PROCEDURE InternalReleaseSpinLock(lockAdr: Address);
+	BEGIN Call2(SYSTEM.TYPECODE(Processors.SpinLock), lockAdr, SYSTEM.ADR(Processors.ReleaseLock))
+	END InternalReleaseSpinLock;
+								
+	PROCEDURE IsLocked*(VAR lock: WaitLock): BOOLEAN;
+	BEGIN RETURN lock.locked
+	END IsLocked;
+
+	PROCEDURE CurrentProcess*(): Address;
+	VAR process: Address;
+	BEGIN 
+		process := running[ProcessorID()]; 
+		ASSERT(process # NilValue);
+		RETURN process
+	END CurrentProcess;
+	
+	(** Generic Process Support *)
+		
+	(** suspend process without putting it to the ready queue, releaseProcedure(param) is called directly after suspension *) 
+	(* 0[EBP] -> old EBP
+	    4[EBP] -> return PC
+	    8[EBP] -> process
+	    old ESP = EBP + 12 *)
+	PROCEDURE SuspendWaiting*(process: Address; releaseProcedure: GenericProcedure; param: Address);
+	VAR EBP, callerEBP, callerESP, callerEIP: Address; id: LONGINT;
+	BEGIN
+		ASSERT(process # NilValue);
+		SYSTEM.GETREG(SYSTEM.EBP, EBP);
+		SYSTEM.GET(EBP, callerEBP);
+		SYSTEM.GET(EBP + 4, callerEIP);
+		callerESP := EBP + 12;
+		SYSTEM.PUT32(process + ProcessBackupPCOffset, callerEIP);
+		SYSTEM.PUT32(process + ProcessBackupESPOffset, callerESP);
+		SYSTEM.PUT32(process + ProcessBackupEBPOffset, callerEBP);
+		SYSTEM.PUT32(process + ProcessStackLimitOffset, Memory.GetStackLimit());
+		id := ProcessorID();
+		ASSERT(running[id] = process); running[id] := NilValue;
+		Memory.SetStackLimit(systemContext[id].stackLimit);
+		IF releaseProcedure # NIL THEN
+			SwitchAndExecute(systemContext[id].esp, systemContext[id].ebp, systemContext[id].pc, releaseProcedure, param)
+		ELSE
+			SwitchContext(systemContext[id].esp, systemContext[id].ebp, systemContext[id].pc)
+		END
+	END SuspendWaiting;
+	
+	(** suspend and put process to ready queue *)
+	PROCEDURE SuspendReady*(process: Address);
+	BEGIN SuspendWaiting(process, SetReady, process)
+	END SuspendReady;
+	
+	(** put process to ready queue, must not be called by interrupt in serial mode *)
+	PROCEDURE SetReady*(process: Address);
+	BEGIN
+		(* lock even needed in serial mode because interrupts may create new processes at any time *) 
+		Processors.AcquireLock(lock);
+		IF (mode = ParallelMode) OR (mode = SemiParallelMode) THEN
+			AddProcessToList(SYSTEM.ADR(parallelReadyList), process)
+		ELSIF mode = SerialMode THEN
+			AddProcessToList(SYSTEM.ADR(serialNewList), process)
+		ELSE HALT(111)
+		END;
+		Processors.ReleaseLock(lock)
+	END SetReady;
+		
+	PROCEDURE ProcessorID(): LONGINT;
+	BEGIN RETURN Processors.ID()
+	END ProcessorID;
+	
+	(* stack state:
+		0[EBP]	old ebp
+		4[EBP]	return pc
+		8[EBP]	process
+		EBP + 12 --> old ESP  *)
+	PROCEDURE SwitchToProcess(process: Address);
+	VAR id: LONGINT; ebp, esp, pc, limit: Address; 
+	BEGIN
+		id := ProcessorID();
+		SYSTEM.GETREG(SYSTEM.EBP, ebp);
+		SYSTEM.GET(ebp + 4, systemContext[id].pc);
+		systemContext[id].esp := ebp + 12;
+		systemContext[id].stackLimit := Memory.GetStackLimit();
+		SYSTEM.GET(ebp, systemContext[id].ebp);
+		SYSTEM.GET(process + ProcessBackupPCOffset, pc);
+		SYSTEM.GET(process + ProcessBackupESPOffset, esp);
+		SYSTEM.GET(process + ProcessBackupEBPOffset, ebp);
+		SYSTEM.GET(process + ProcessStackLimitOffset, limit);
+		Memory.SetStackLimit(limit);
+		ASSERT(running[id] = NilValue); running[id] := process;
+		SwitchContext(esp, ebp, pc)
+	END SwitchToProcess;
+	
+	PROCEDURE UsesSystemStack*(): BOOLEAN;
+	BEGIN RETURN systemStack[Processors.ID()].inUse
+	END UsesSystemStack;
+		
+	(* Stack layout:
+		0[EBP]				-> caller EBP
+		4[EBP]				-> caller return EIP
+		callerESP			-> [caller locals] *)
+	PROCEDURE SwitchToSystemStack*(VAR backup: Address);
+	VAR EBP, callerEBP, callerESP, callerEIP, newESP: Address; id: LONGINT;
+	BEGIN
+		SYSTEM.GETREG(SYSTEM.EBP, EBP);
+		SYSTEM.GET(EBP, callerEBP);
+		SYSTEM.GET(EBP + 4, callerEIP);
+		callerESP := EBP + 8;
+	
+		id := ProcessorID();
+		ASSERT(~systemStack[id].inUse); systemStack[id].inUse := TRUE;
+
+		newESP := systemStack[id].stackBlock + SystemStackSize;
+		DEC(newESP, 4); SYSTEM.PUT32(newESP, callerESP);
+		
+		backup := Memory.GetStackLimit();
+		Memory.SetStackLimit(systemStack[id].stackBlock);
+		SwitchContext(newESP, callerEBP, callerEIP); (* exists this procedure *)
+		HALT(80) (* not reachable *)
+	END SwitchToSystemStack;
+	
+	(*   Stack layout:
+			0[EBP]	-> caller EBP
+			4[EBP]	-> caller return EIP
+			8[EBP]	-> original ESP *)
+	PROCEDURE ReturnFromSystemStack*(VAR backup: Address);
+	VAR EBP, callerEBP, callerEIP, originalESP: Address; id: LONGINT;
+	BEGIN
+		SYSTEM.GETREG(SYSTEM.EBP, EBP);
+		SYSTEM.GET(EBP, callerEBP);
+		SYSTEM.GET(EBP + 4, callerEIP);
+		SYSTEM.GET(EBP + 8, originalESP);
+	
+		id := ProcessorID();
+		ASSERT(systemStack[id].inUse); systemStack[id].inUse := FALSE;
+		
+		Memory.SetStackLimit(backup);
+		SwitchContext(originalESP, callerEBP, callerEIP); (* exists this procedure *)
+		HALT(80) (* not reachable *)
+	END ReturnFromSystemStack;
+		
+	PROCEDURE ReturnToSystemAndExecute*(procedure: GenericProcedure; param: Address);
+	VAR id: LONGINT;
+	BEGIN
+		id := ProcessorID();
+		ASSERT(running[id] # NilValue); running[id] := NilValue;
+		Memory.SetStackLimit(systemContext[id].stackLimit);
+		SwitchAndExecute(systemContext[id].esp, systemContext[id].ebp, systemContext[id].pc, procedure, param)
+	END ReturnToSystemAndExecute;
+	
+	PROCEDURE ReturnFromTrap*;
+	VAR id: LONGINT;
+	BEGIN
+		id := ProcessorID();
+		IF running[id] # NilValue THEN 
+			running[id] := NilValue;
+			Memory.SetStackLimit(systemContext[id].stackLimit);
+			SwitchContext(systemContext[id].esp, systemContext[id].ebp, systemContext[id].pc)
+		ELSE
+			ProcessorLoop
+		END
+	END ReturnFromTrap;
+	
+	PROCEDURE -SwitchContext(esp, ebp, eip: Address);
+	CODE {SYSTEM.i386}
+		POP EAX 	; eip
+		POP EBP	 ; ebp
+		POP EBX	 ; esp
+		MOV ESP, EBX	
+		JMP EAX     ; absolute jump to EIP
+	END SwitchContext;
+	
+	(* executes procAdr(param) directly after switch *)
+	PROCEDURE -SwitchAndExecute(newESP, newEBP, newEIP: Address; procedure: GenericProcedure; param: Address);
+	CODE {SYSTEM.i386}
+		POP EAX	; param
+		POP EBX    ; procedure
+		POP ECX	; newEIP
+		POP EBP	; newEBP
+		POP EDX	; newESP
+		MOV ESP, EDX ; use new stack
+		PUSH ECX  ; backup newEIP
+		PUSH EAX ; stackAdr
+		CALL EBX  (* procedure(param) *)
+		POP ECX  ; restore newEIP
+		JMP ECX
+	END SwitchAndExecute;
+	
+	(** Dynamic stack management *)
+	
+	(*   Stack layout:
+			0[EBP]			-> caller EBP
+			4[EBP]			-> caller return EIP
+			8[EBP]			-> size parameter
+			12[EBP]		  -> ADR(extStackAdr) parameter
+			callerESP    	-> [caller locals]	 *)
+	PROCEDURE ExtendStack*(VAR extStackAdr: Address; size: LONGINT);
+	VAR EBP, callerEBP, callerESP, callerEIP, newESP: Address;  
+	BEGIN
+		SYSTEM.GETREG(SYSTEM.EBP, EBP);
+		SYSTEM.GET(EBP, callerEBP);
+		SYSTEM.GET(EBP + 4, callerEIP);
+		callerESP := EBP + 16;
+		
+		Heap.New(extStackAdr, size);
+		
+		newESP := extStackAdr + size;
+		DEC(newESP, 4); SYSTEM.PUT32(newESP, Memory.GetStackLimit());
+		DEC(newESP, 4); SYSTEM.PUT32(newESP, callerESP);
+		
+		Memory.SetStackLimit(extStackAdr);
+		SwitchContext(newESP, callerEBP, callerEIP); (* exits this procedure *)
+		HALT(80) (* not reachable *)
+	END ExtendStack;
+	
+	(*   Stack layout:
+			0[EBP]	-> caller EBP
+			4[EBP]	-> caller return EIP
+			8[EBP]	-> extStackAdr parameter
+			--- values by ExtendStack ----
+			12[EBP]    -> original ESP
+			16[EBP]	-> original stack limit *)	
+	PROCEDURE ReduceStack*(extStackAdr: Address);
+	VAR EBP, callerEBP, callerEIP, originalESP, originalLimit: Address; 
+	BEGIN
+		SYSTEM.GETREG(SYSTEM.EBP, EBP);
+		SYSTEM.GET(EBP, callerEBP);
+		SYSTEM.GET(EBP + 4, callerEIP);
+		SYSTEM.GET(EBP + 12, originalESP);
+		SYSTEM.GET(EBP + 16, originalLimit);
+		
+		Memory.SetStackLimit(originalLimit);
+		SwitchAndExecute(originalESP, callerEBP, callerEIP, Heap.Delete, extStackAdr); (* exits this procedure *)
+		HALT(80) (* not reachable *)
+	END ReduceStack;
+							
+	PROCEDURE -AtomicInc*(VAR x: LONGINT);
+	CODE {SYSTEM.i386}
+		POP EAX	; ADR(x)
+		LOCK
+		INC DWORD [EAX]
+	END AtomicInc;
+	
+	PROCEDURE -AtomicDec*(VAR x: LONGINT);
+	CODE {SYSTEM.i386}
+		POP EAX	; ADR(x)
+		LOCK
+		DEC DWORD [EAX]
+	END AtomicDec;
+	
+	PROCEDURE -Call2(arg1, arg2, proc: Address);
+	CODE {SYSTEM.i386}
+		POP EAX
+		CALL EAX
+	END Call2;
+					
+	(* no memory access for significant performance improvement on hyper-threaded processors *)
+	PROCEDURE -Pause(loops: CARDINAL);
+	CODE {SYSTEM.i386}
+		POP EAX
+	continue:
+		CMP EAX, 0
+		JE end
+		XOR ECX, ECX
+		REP NOP	; PAUSE
+		DEC EAX
+		JMP continue
+	end:
+	END Pause;
+		
+	PROCEDURE IdleTime;
+	BEGIN
+		(* boot processor is always active to handle normal interrupts *)
+		IF (Processors.APICFeature IN Processors.features) & 
+				(Processors.HyperThreading IN Processors.features) THEN
+			AtomicInc(halted);
+			Interrupts.ProcessorHalt; (* reactivated by timer interrupt *)
+			AtomicDec(halted)
+		ELSE
+			SpinWait(100) (* 100us *)
+		END
+	END IdleTime;
+					
+	(** Timer in ms *)
+	PROCEDURE Time*(): CARDINAL;
+	BEGIN RETURN Interrupts.timerTicks * Interrupts.TimerTickRate
+	END Time;
+	
+	PROCEDURE InitializeConcurrency;
+	VAR i: LONGINT;
+	BEGIN
+		FOR i := 0 TO MaxProcessors-1 DO 
+			systemContext[i].pc := NilValue;
+			systemContext[i].ebp := NilValue;
+			systemContext[i].esp := NilValue;
+			Heap.New(systemStack[i].stackBlock, SystemStackSize);
+			systemStack[i].inUse := FALSE; 
+			running[i] := NilValue
+		END;
+		InitializeProcessList(SYSTEM.ADR(parallelReadyList));
+		InitializeProcessList(SYSTEM.ADR(serialReadyList));
+		InitializeProcessList(SYSTEM.ADR(serialNewList));
+		InitializeProcessList(SYSTEM.ADR(priorityList));
+		Interrupts.InstallInterruptHandler(Interrupts.TimerIRQ, TimerInterruptHandler)
+	END InitializeConcurrency;
+	
+	(* must only be called from the module body *)
+	PROCEDURE RunAsProcess;
+	VAR currentEBP, returnPC, callerEBP, callerRetPC, newESP, newEBP, process: Address; size: LONGINT;
+	BEGIN 
+		SYSTEM.GETREG(SYSTEM.EBP, currentEBP); 
+		SYSTEM.GET(currentEBP, callerEBP); 
+		SYSTEM.GET(currentEBP + 4, returnPC);
+		ASSERT(callerEBP = currentEBP + 8); (* no locals *)
+		SYSTEM.GET(callerEBP + 4, callerRetPC);
+		size := ProcessMinHeaderSize + SystemStackSize;
+		Heap.New(process, size); 
+		newESP := process + size - 8; newEBP := newESP;
+		SYSTEM.PUT32(newESP + 0, NilValue);
+		SYSTEM.PUT32(newESP + 4, callerRetPC);
+		SYSTEM.PUT32(process + ProcessBackupPCOffset, returnPC);
+		SYSTEM.PUT32(process + ProcessBackupESPOffset, newESP);
+		SYSTEM.PUT32(process + ProcessBackupEBPOffset, newEBP);
+		SYSTEM.PUT32(process + ProcessPrevProcessOffset, NilValue);
+		SYSTEM.PUT32(process + ProcessNextProcessOffset, NilValue);
+		SetReady(process);
+		ProcessorLoop;
+		HALT(80) (* not reachable *)
+	END RunAsProcess;
+	
+	PROCEDURE ParallelScheduler;
+	VAR startMode: SchedulerMode; process: Address;
+	BEGIN
+		startMode := mode;
+		WHILE mode = startMode DO
+			IF priorityList.first # NilValue THEN
+				Processors.AcquireLock(lock);
+				process := priorityList.first;
+				IF process # NilValue THEN
+					RemoveProcessFromList(SYSTEM.ADR(priorityList), process);
+					Processors.ReleaseLock(lock);
+					SwitchToProcess(process)
+				ELSE
+					Processors.ReleaseLock(lock)
+				END
+			ELSIF parallelReadyList.first # NilValue THEN
+				Processors.AcquireLock(lock);
+				process := parallelReadyList.first;
+				IF process # NilValue THEN
+					RemoveProcessFromList(SYSTEM.ADR(parallelReadyList), process);
+					Processors.ReleaseLock(lock);
+					SwitchToProcess(process)
+				ELSE
+					Processors.ReleaseLock(lock)
+				END
+			ELSE
+				IdleTime
+			END
+		END
+	END ParallelScheduler;
+		
+	PROCEDURE SemiParallelScheduler;
+	VAR startMode: SchedulerMode; process: Address; bootCPU: BOOLEAN; 
+	BEGIN
+		startMode := mode; bootCPU := Processors.ID() = Processors.bootID; 
+		WHILE mode = startMode DO
+			IF bootCPU & (priorityList.first # NilValue) THEN
+				Processors.AcquireLock(lock);
+				process := priorityList.first;
+				RemoveProcessFromList(SYSTEM.ADR(priorityList), process);
+				Processors.ReleaseLock(lock);
+				SwitchToProcess(process)
+			ELSIF (bootCPU OR (avgSyncPerTick <= MaxSyncPerTick)) & (parallelReadyList.first # NilValue) THEN
+				Processors.AcquireLock(lock);
+				process := parallelReadyList.first;
+				IF process # NilValue THEN
+					RemoveProcessFromList(SYSTEM.ADR(parallelReadyList), process);
+					Processors.ReleaseLock(lock);
+					SwitchToProcess(process)
+				ELSE
+					Processors.ReleaseLock(lock)
+				END
+			ELSE
+				IdleTime
+			END
+		END
+	END SemiParallelScheduler;
+	
+	PROCEDURE SerialScheduler;
+	VAR startMode: SchedulerMode; process: Address;
+	BEGIN
+		startMode := mode; 
+		WHILE mode = startMode DO
+			IF priorityList.first # NilValue THEN
+				Processors.AcquireLock(lock);
+				process := priorityList.first;
+				RemoveProcessFromList(SYSTEM.ADR(priorityList), process);
+				Processors.ReleaseLock(lock);
+				SwitchToProcess(process)
+			ELSIF serialReadyList.first # NilValue THEN
+				process := serialReadyList.first;
+				RemoveProcessFromList(SYSTEM.ADR(serialReadyList), process);
+				SwitchToProcess(process)
+			ELSIF serialNewList.first # NilValue THEN
+				Processors.AcquireLock(lock);
+				serialReadyList := serialNewList;
+				InitializeProcessList(SYSTEM.ADR(serialNewList));
+				Processors.ReleaseLock(lock)
+			ELSE
+				IdleTime
+			END
+		END
+	END SerialScheduler;
+		
+	PROCEDURE ProcessorLoop;
+	VAR bootCPU: BOOLEAN;
+	BEGIN
+		bootCPU := Processors.bootID = Processors.ID();
+		LOOP
+			IF changeMode THEN
+				AtomicInc(waitChange);
+				WHILE changeMode DO IdleTime END;
+				AtomicDec(waitChange)
+			ELSIF mode = SerialMode THEN
+				IF bootCPU THEN 
+					SerialScheduler 
+				ELSE
+					WaitForModeChange 
+				END
+			ELSIF mode = ParallelMode THEN
+				ParallelScheduler
+			ELSIF mode = SemiParallelMode THEN
+				SemiParallelScheduler
+			ELSE HALT(111)
+			END
+		END
+	END ProcessorLoop;
+	
+	(** TRUE if mode has been changed *)
+	PROCEDURE ChangeMode*(newMode: SchedulerMode): BOOLEAN;
+	BEGIN
+		ASSERT(mode IN {SerialMode, ParallelMode, SemiParallelMode});
+		IF (mode # newMode) & (serialNewList.first = NilValue) & (serialReadyList.first = NilValue) & 
+				(parallelReadyList.first = NilValue) THEN
+			changeMode := TRUE; mode := newMode;
+			WHILE waitChange < Processors.nofProcessors-1 DO SpinWait(10) END;
+			changeMode := FALSE;
+			RETURN TRUE
+		ELSE RETURN mode = newMode
+		END
+	END ChangeMode;
+					
+	PROCEDURE WaitForModeChange;
+	VAR startMode: SchedulerMode;
+	BEGIN
+		startMode := mode;
+		WHILE mode = startMode DO
+			IdleTime
+		END
+	END WaitForModeChange;
+			
+	(** Generic process lists *)
+	PROCEDURE InitializeProcessList*(listAdr: Address);
+	BEGIN
+		SYSTEM.PUT32(listAdr + ProcessListFirstOffset, NilValue);
+		SYSTEM.PUT32(listAdr + ProcessListLastOffset, NilValue)
+	END InitializeProcessList;
+	
+	PROCEDURE AddProcessToList*(list: Address; process: Address);
+	VAR last: Address;
+	BEGIN		
+		SYSTEM.GET(list + ProcessListLastOffset, last);
+		SYSTEM.PUT32(process + ProcessPrevProcessOffset, last);
+		SYSTEM.PUT32(process + ProcessNextProcessOffset, NilValue);
+		IF last = NilValue THEN
+			SYSTEM.PUT32(list + ProcessListFirstOffset, process)
+		ELSE
+			SYSTEM.PUT32(last + ProcessNextProcessOffset, process)
+		END;
+		SYSTEM.PUT32(list + ProcessListLastOffset, process)
+	END AddProcessToList;
+	
+	PROCEDURE RemoveProcessFromList*(list: Address; process: Address);
+	VAR first, last, next, prev: Address;
+	BEGIN
+		SYSTEM.GET(list + ProcessListFirstOffset, first);
+		SYSTEM.GET(list + ProcessListLastOffset, last);
+		SYSTEM.GET(process + ProcessPrevProcessOffset, prev);
+		SYSTEM.GET(process + ProcessNextProcessOffset, next);
+		IF prev # NilValue THEN
+			SYSTEM.PUT32(prev + ProcessNextProcessOffset, next)
+		END;
+		IF next # NilValue THEN
+			SYSTEM.PUT32(next + ProcessPrevProcessOffset, prev)
+		END;
+		IF first = process THEN
+			SYSTEM.PUT32(list + ProcessListFirstOffset, next)
+		END;
+		IF last = process THEN
+			SYSTEM.PUT32(list + ProcessListLastOffset, prev)
+		END;
+		SYSTEM.PUT32(process + ProcessPrevProcessOffset, NilValue);
+		SYSTEM.PUT32(process + ProcessNextProcessOffset, NilValue)
+	END RemoveProcessFromList;
+			
+	(* Multi-processor support *)
+	PROCEDURE TimerInterruptHandler(VAR state: Interrupts.InterruptState);
+	BEGIN ActivateHaltedProcessors
+	END TimerInterruptHandler;
+	
+	PROCEDURE ActivateHaltedProcessors;
+	CONST AgingRate = 50;
+	BEGIN
+		avgSyncPerTick := (avgSyncPerTick * (AgingRate - 1) + syncPerTick) DIV AgingRate; syncPerTick := 0;
+		IF MPStarted & (Processors.APICFeature IN Processors.features) THEN
+			IF changeMode OR ((parallelReadyList.first # NilValue) &
+					((mode # SemiParallelMode) OR (avgSyncPerTick <= MaxSyncPerTick))) THEN
+				Interrupts.ApicStartHaltedProcessors
+			END
+		END;
+		syncPerTick := 0
+	END ActivateHaltedProcessors;
+			
+	(* Synchronization of booting processors, must not perform stack modification *)		
+	PROCEDURE InitializeBootLock;
+	CONST FalseValue = 0;
+	BEGIN MPBootLock := FalseValue
+	END InitializeBootLock;
+	
+	PROCEDURE -AcquireBootLock;
+	CONST TrueValue = 1;
+	CODE {SYSTEM.i386}
+		LEA EBX, MPBootLock 		; ADR(bootLock)
+		MOV AL, TrueValue
+	spin:
+		XCHG [EBX], AL			 ; atomic set and read, implicit LOCK prefix, implicit memory fence for cache coherence
+		CMP AL, TrueValue
+		JNE exit
+		XOR ECX, ECX			   ; just in case some processor interprets REP not as part of PAUSE
+		REP NOP					   ; PAUSE instructions for spin lock speedup (see IA32 MP specification)
+		JMP spin
+	exit:
+	END AcquireBootLock;
+	
+	PROCEDURE -ReleaseBootLock;
+	CONST FalseValue = 0;
+	CODE {SYSTEM.i386}
+		LEA EBX, MPBootLock		; ADR(bootLock)
+		MOV AL, FalseValue
+		XCHG [EBX], AL			; implicit memory fence for cache coherence, update signal to other processors
+	END ReleaseBootLock;
+	
+	(* Start procedure for additional processors in a multi-processor system
+		- all processors start in parallel with the same boot stack, synchronized by boot lock (must not modify the stack)
+		- processors switch to individual kernel stacks *)
+	PROCEDURE StartAdditionalProcessor {UNCHECKED};
+	(* must not involve stack overflow checking *)
+	(* must not have local variables due to Memory.InitializeSystemStacks *)
+	BEGIN
+		AcquireBootLock;
+		Processors.InitializeProcessor;
+		Memory.InitializeSystemStacks;
+		Interrupts.Start;
+		Interrupts.SwitchToUserLevel;
+		ReleaseBootLock;
+		Interrupts.InitializeAPIC;
+		ProcessorLoop;
+		HALT(80) (* should not reach this instruction *)
+	END StartAdditionalProcessor;
+	
+	PROCEDURE SpinWait*(microseconds: CARDINAL);
+	BEGIN Pause((pauseLoopRate * microseconds) DIV 1000)
+	END SpinWait;
+	
+	(* Broadcast start signal for other processors, see IA32, vol 3, 7.5.4.1.15 *)
+	PROCEDURE StartOtherProcessors(bootAdr: CARDINAL);
+	CONST PS =  4*Memory.KB;
+	VAR bootVector: CARDINAL; k, i: LONGINT;
+	BEGIN
+		ASSERT((bootAdr >= 0) & (bootAdr < Memory.MB) & (bootAdr MOD PS = 0)); 
+		bootVector := bootAdr DIV PS;
+		SpinWait(20000); (* 20ms *)
+		Interrupts.ApicINITBroadcast;
+		SpinWait(400); (* 400us *)
+		FOR i := 1 TO 5 DO
+			Interrupts.ApicSIPIBroadcast(bootVector);
+			SpinWait(400) (* 400us *)
+		END
+	END StartOtherProcessors;
+	
+	PROCEDURE MeasurePauseLoopRate;
+	CONST MeasureRate = 1000; Rate = 50;
+	VAR ticks, k: CARDINAL;
+	BEGIN
+		ticks := Interrupts.timerTicks;
+		WHILE Interrupts.timerTicks = ticks DO END; (* await new timer interval *)
+		ticks := Interrupts.timerTicks; k := 0;
+		REPEAT
+			Pause(MeasureRate); INC(k)
+		UNTIL Interrupts.timerTicks >= ticks + Rate;
+		pauseLoopRate := (k * MeasureRate) DIV Interrupts.TimerTickRate DIV Rate
+	END MeasurePauseLoopRate;
+	
+	PROCEDURE InitializeMultiProcessors;
+	VAR pageAdr: CARDINAL; 
+	BEGIN
+		InitializeBootLock; halted := 0; waitChange := 0; changeMode := FALSE;
+		IF Processors.APICFeature IN Processors.features THEN
+			Processors.InitializeMPBootPage(pageAdr, StartAdditionalProcessor, Memory.GDTBaseAddress(), 
+				Memory.KernelStackSegmentSelector);
+			StartOtherProcessors(pageAdr);
+			MPStarted := TRUE
+		END;
+		IF Processors.nofProcessors = 1 THEN mode := SerialMode END
+	END InitializeMultiProcessors;
+
+BEGIN
+	mode := DefaultMode;
+	Processors.InitializeLock(lock); 
+	MPStarted := FALSE;
+	InitializeConcurrency;
+	MeasurePauseLoopRate;
+	InitializeMultiProcessors;
+	RunAsProcess
+END Concurrency.
+

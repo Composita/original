@@ -1,0 +1,435 @@
+MODULE Output; (** Kernel, Display Output, 2007 by Luc Blaeser *)
+	IMPORT SYSTEM, Processors;
+	
+	CONST 
+		VesaMode = 117; (* mode 117: 1024 * 768 * 16; mode 118: 1024 * 768 * 32 *)
+	
+	TYPE Color* = LONGINT;
+	CONST 
+		Red* = 00FF0000H; Green* = 0000FF00H; Blue* = 000000FFH; 
+		White* = 00FFFFFFH; Black* = 00000000H;
+		
+	TYPE 
+		View* = RECORD
+			topX-, topY-, width-, height-, border-, margin-: LONGINT;
+			innerX-, innerY-, innerWidth-, innerHeight-: LONGINT;
+			borderColor-, backgroundColor-: Color;
+			relCursorX, relCursorY: LONGINT; (* relative to innerX/innerY *)
+			scrollDistance: LONGINT;
+		END;
+		
+	VAR 
+		Width-, Height-, PixelSize-: LONGINT;
+		lock: Processors.SpinLock;
+		standardInput-, standardOutput-, graphicOutput-: View;
+	
+	CONST GlyphWidth* = 8; GlyphHeight* = 12;
+	TYPE Glyph* = ARRAY GlyphWidth * GlyphHeight OF BOOLEAN;
+	VAR glyphs-: ARRAY 256 OF Glyph;
+	
+	PROCEDURE InitializeMode;
+	BEGIN
+		IF VesaMode = 117 THEN Width := 1024; Height := 768; PixelSize := 2
+		ELSIF VesaMode = 118 THEN Width := 1024; Height := 768; PixelSize := 4
+		ELSE HALT(111) (* not supported *)
+		END
+	END InitializeMode;
+	
+	PROCEDURE InitializeView(VAR view: View; x, y, w, h, b, m: LONGINT; boc, bgc: Color);
+	BEGIN 
+		view.topX := x; view.topY := y; view.width := w; view.height := h; view.border := b; view.margin := m;
+		view.innerX := x + b + m; view.innerY := y + b + m; view.innerWidth := w - 2 * (b + m); view.innerHeight := h - 2 * (b + m);
+		view.borderColor := boc; view.backgroundColor := bgc;
+		view.relCursorX := 0; view.relCursorY := 0; view.scrollDistance := GlyphHeight;
+		ClearView(view)
+	END InitializeView;
+	
+	PROCEDURE ClearView*(VAR view: View);
+	BEGIN 
+		Fill(view.topX, view.topY, view.width, view.height, view.backgroundColor);
+		IF view.topY # 0 THEN 
+			Fill(view.topX, view.topY, view.width, view.border, view.borderColor) 
+		END;
+		IF view.topY + view.height # Height THEN 
+			Fill(view.topX, view.topY + view.height - view.border, view.width, view.border, view.borderColor)
+		END;
+		IF view.topX # 0 THEN 
+			Fill(view.topX, view.topY, view.border, view.height, view.borderColor)
+		END;
+		IF view.topX + view.width # Width THEN 
+			Fill(view.topX + view.width - view.border, view.topY, view.border, view.height, view.borderColor)
+		END
+	END ClearView;
+		
+	PROCEDURE Write(VAR view: View; char: CHAR; color: Color);
+	BEGIN
+		IF char = 0DX THEN (* CR *)
+			view.relCursorX := 0
+		ELSIF char = 0AX THEN (* LF *)
+			IF view.relCursorY + 2 * GlyphHeight <= view.innerHeight THEN
+				INC(view.relCursorY, GlyphHeight)
+			ELSE
+				ScrollUp(view, view.scrollDistance);
+				DEC(view.relCursorY, view.scrollDistance - GlyphHeight)
+			END
+		ELSIF char = 09X THEN (* BackSpace *)
+			IF view.relCursorX >= GlyphWidth THEN
+				DEC(view.relCursorX, GlyphWidth); 
+				Fill(view.innerX + view.relCursorX, view.innerY + view.relCursorY, GlyphWidth, GlyphHeight, view.backgroundColor)
+			END
+		ELSE
+			Font(view.innerX + view.relCursorX, view.innerY + view.relCursorY, char, color);
+			INC(view.relCursorX, GlyphWidth);
+			IF view.relCursorX + GlyphWidth > view.innerWidth THEN
+				view.relCursorX := 0;
+				IF view.relCursorY + 2 * GlyphHeight <= view.innerHeight THEN
+					INC(view.relCursorY, GlyphHeight)
+				ELSE
+					ScrollUp(view, view.scrollDistance);
+					DEC(view.relCursorY, view.scrollDistance - GlyphHeight)
+				END
+			END
+		END
+	END Write;
+	
+	PROCEDURE ScrollUp(VAR view: View; diff: LONGINT);
+	VAR y: LONGINT;
+	BEGIN
+		FOR y := view.innerY TO view.innerY + view.innerHeight - diff - 1 DO
+			SYSTEM.MOVE(Processors.displayAddress + ((y + diff) * Width + view.innerX) * PixelSize, 
+				Processors.displayAddress + (y * Width + view.innerX) * PixelSize, view.innerWidth * PixelSize)
+		END;
+		Fill(view.innerX, view.innerY + view.innerHeight - diff, view.innerWidth, diff, view.backgroundColor)
+	END ScrollUp;
+	
+	PROCEDURE InitializeScreen;
+	CONST H = 60;
+	BEGIN
+		InitializeView(standardInput, 0, 0, Width, H, 1, 5, Black, White);
+		InitializeView(standardOutput, 0, H, Width DIV 2, Height - H, 0, 6, Black, White);
+		InitializeView(graphicOutput, Width DIV 2, H, Width - Width DIV 2, Height - H, 0, 6, Black, White);
+		standardOutput.scrollDistance := 10 * GlyphHeight
+	END InitializeScreen;
+		
+	PROCEDURE SetPixel*(x, y: LONGINT; color: Color);
+	VAR index: LONGINT;
+	BEGIN 
+		IF (x >= 0) & (x < Width) & (y >= 0) & (y < Height) THEN
+			index := ColorToIndex(color);
+			IF PixelSize = 2 THEN
+				SYSTEM.PUT16(Processors.displayAddress + (y * Width + x) * PixelSize, index)
+			ELSIF PixelSize = 4 THEN
+				SYSTEM.PUT32(Processors.displayAddress + (y * Width + x) * PixelSize, index)
+			ELSE HALT(111) (* not supported *)
+			END
+		END
+	END SetPixel;
+	
+	PROCEDURE GetPixel*(x, y: LONGINT; VAR color: Color);
+	VAR index: LONGINT;
+	BEGIN
+		IF (x >= 0) & (x < Width) & (y >= 0) & (y < Height) THEN
+			IF PixelSize = 2 THEN
+				index := SYSTEM.GET16(Processors.displayAddress + (y * Width + x) * PixelSize)
+			ELSIF PixelSize = 4 THEN
+				index := SYSTEM.GET32(Processors.displayAddress + (y * Width + x) * PixelSize)
+			ELSE HALT(111)
+			END;
+			color := IndexToColor(index)
+		END
+	END GetPixel;
+	
+	PROCEDURE ColorToIndex(color: Color): LONGINT;
+	VAR x: LONGINT;
+	BEGIN
+		IF PixelSize = 2 THEN
+			x := SYSTEM.VAL(LONGINT, 
+				SYSTEM.VAL(SET, ASH(color, 15-23)) * {11..15} +
+				SYSTEM.VAL(SET, ASH(color, 10-15)) * {5..10} +
+				SYSTEM.VAL(SET, ASH(color, 4-7)) * {0..4});
+			RETURN ASH(x, 16) + x MOD 10000H
+		ELSIF PixelSize = 4 THEN
+			RETURN color
+		ELSE HALT(111)
+		END
+	END ColorToIndex;
+	
+	PROCEDURE IndexToColor(index: LONGINT): Color;
+	BEGIN
+		IF PixelSize = 2 THEN
+			RETURN
+				ASH(SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, index) * {11..15}), 15-23) +
+				ASH(SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, index) * {5..10}), 10-5) +
+				ASH(SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, index) * {0..4}), 4-7)
+		ELSIF PixelSize = 4 THEN
+			RETURN index
+		ELSE HALT(111)
+		END
+	END IndexToColor;
+	
+	PROCEDURE Fill*(x, y, w, h: LONGINT; color: Color);
+	VAR i, j, index: LONGINT; adr: CARDINAL;
+	BEGIN
+		IF x < 0 THEN x := 0 END; IF y < 0 THEN y := 0 END;
+		IF x >= Width THEN x := Width - 1 END;
+		IF y >= Height THEN y := Height - 1 END;
+		IF x + w > Width THEN w := Width - x END;
+		IF y + h > Height THEN h := Height - y END;
+		IF w < 0 THEN w := 0 END; IF h < 0 THEN h := 0 END;
+		FOR j := y TO y + h - 1 DO
+			adr := Processors.displayAddress + (j * Width + x) * PixelSize;
+			FOR i := x TO x + w - 1 DO
+				index := ColorToIndex(color);
+				IF PixelSize = 2 THEN
+					SYSTEM.PUT16(adr, index)
+				ELSIF PixelSize = 4 THEN
+					SYSTEM.PUT32(adr, index)
+				ELSE HALT(111)
+				END;
+				adr := adr + PixelSize
+			END
+		END
+	END Fill;
+			
+	PROCEDURE Font*(x, y: LONGINT; char: CHAR; color: Color);
+	VAR k, i, j: LONGINT;
+	BEGIN
+		k := ORD(char); IF k < 0 THEN k := 0 END; 
+		FOR i := 0 TO GlyphHeight-1 DO
+			FOR j := 0 TO GlyphWidth-1 DO
+				IF glyphs[k][i * GlyphWidth + j] THEN SetPixel(x + j, y + i, color) END
+			END
+		END
+	END Font;
+	
+	PROCEDURE InitGlyph(x: CHAR; code: ARRAY OF CHAR);
+	VAR i, k, a: LONGINT;
+	BEGIN
+		k := 0; 
+		WHILE (k < LEN(code)) & (code[k] # 0X) DO
+			IF ORD(code[k]) >= ORD("A") THEN 
+				a := ORD(code[k]) - ORD("A") + 10
+			ELSE 
+				a := ORD(code[k]) - ORD("0")
+			END;
+			FOR i := 3 TO 0 BY -1 DO
+				glyphs[ORD(x)][k * 4 + i] := ODD(a); 
+				a := a DIV 2
+			END;
+			INC(k)
+		END
+	END InitGlyph;
+	
+	PROCEDURE InitializeGlyphs;
+	BEGIN
+		(* generated by module FontReader *)
+		InitGlyph("A", "182424427E42424200000000");
+		InitGlyph("B", "7C42427C4242427C00000000");
+		InitGlyph("C", "1E2040404040201E00000000");
+		InitGlyph("D", "784442424242447800000000");
+		InitGlyph("E", "7E40407E4040407E00000000");
+		InitGlyph("F", "7E40407C4040404000000000");
+		InitGlyph("G", "3C4240404E42423C00000000");
+		InitGlyph("H", "4242427E4242424200000000");
+		InitGlyph("I", "7C1010101010107C00000000");
+		InitGlyph("J", "7C0404040404443800000000");
+		InitGlyph("K", "444850605048444400000000");
+		InitGlyph("L", "404040404040407E00000000");
+		InitGlyph("M", "42665A424242424200000000");
+		InitGlyph("N", "426252524A4A464200000000");
+		InitGlyph("O", "3C4242424242423C00000000");
+		InitGlyph("P", "7C4242427C40404000000000");
+		InitGlyph("Q", "3C424242424A443A00000000");
+		InitGlyph("R", "7C42427C5048444200000000");
+		InitGlyph("S", "3C42403C0202423C00000000");
+		InitGlyph("T", "7C1010101010101000000000");
+		InitGlyph("U", "424242424242423C00000000");
+		InitGlyph("V", "424242242424181800000000");
+		InitGlyph("W", "414141412A2A2A1400000000");
+		InitGlyph("X", "424224181824424200000000");
+		InitGlyph("Y", "444428281010101000000000");
+		InitGlyph("Z", "7E0204081020407E00000000");
+		InitGlyph("a", "000038443C44443C00000000");
+		InitGlyph("b", "404040784444447800000000");
+		InitGlyph("c", "000038444040443800000000");
+		InitGlyph("d", "0404043C4444443C00000000");
+		InitGlyph("e", "000038447C40443800000000");
+		InitGlyph("f", "182020382020202000000000");
+		InitGlyph("g", "000000384444443C04443800");
+		InitGlyph("h", "404040784444444400000000");
+		InitGlyph("i", "100000101010101000000000");
+		InitGlyph("j", "000800000808080808483000");
+		InitGlyph("k", "404040485060504800000000");
+		InitGlyph("l", "101010101010101000000000");
+		InitGlyph("m", "0000EC929292929200000000");
+		InitGlyph("n", "000078444444444400000000");
+		InitGlyph("o", "000038444444443800000000");
+		InitGlyph("p", "000078444444447840404000");
+		InitGlyph("q", "00003C444444443C04040400");
+		InitGlyph("r", "00005C604040404000000000");
+		InitGlyph("s", "000018241008241800000000");
+		InitGlyph("t", "10103C101010100C00000000");
+		InitGlyph("u", "000044444444443C00000000");
+		InitGlyph("v", "000044442828101000000000");
+		InitGlyph("w", "000054545428282800000000");
+		InitGlyph("x", "000048483030484800000000");
+		InitGlyph("y", "000044444444443C04443800");
+		InitGlyph("z", "00003C040810203C00000000");
+		InitGlyph("0", "384444444444443800000000");
+		InitGlyph("1", "081828080808080800000000");
+		InitGlyph("2", "384404081020407C00000000");
+		InitGlyph("3", "384404180404443800000000");
+		InitGlyph("4", "081828487C08080800000000");
+		InitGlyph("5", "7C4078440404443800000000");
+		InitGlyph("6", "182040784444443800000000");
+		InitGlyph("7", "7C0408101020202000000000");
+		InitGlyph("8", "384444384444443800000000");
+		InitGlyph("9", "384444443C04443800000000");
+		InitGlyph("&", "384428102A44443A00000000");
+		InitGlyph("'", "101010000000000000000000");
+		InitGlyph("@", "003E419DA5A59D4238000000");
+		InitGlyph(":", "000018180000181800000000");
+		InitGlyph(",", "000000000000181808081000");
+		InitGlyph("/", "080810102020404000000000");
+		InitGlyph("$", "103854301018543810000000");
+		InitGlyph(".", "000000000000181800000000");
+		InitGlyph(22X, "282828000000000000000000");
+		InitGlyph("=", "0000007C00007C0000000000");
+		InitGlyph("!", "101010101000001000000000");
+		InitGlyph("<", "000810204020100800000000");
+		InitGlyph(">", "002010080408102000000000");
+		InitGlyph("(", "081020204040202010080000");
+		InitGlyph(")", "201008080404080810200000");
+		InitGlyph("[", "382020202020202020380000");
+		InitGlyph("]", "380808080808080808380000");
+		InitGlyph("{", "182020204020202020180000");
+		InitGlyph("}", "300808080408080808300000");
+		InitGlyph("-", "000000007C00000000000000");
+		InitGlyph("%", "6464081010204C4C00000000");
+		InitGlyph("+", "000010107C10100000000000");
+		InitGlyph("?", "384404081010001000000000");
+		InitGlyph(";", "000018180000181808081000");
+		InitGlyph("*", "000010543828440000000000");
+		InitGlyph("_", "00000000000000FF00000000");
+		InitGlyph("#", "0000247E24247E2400000000");
+		InitGlyph("~", "000000006498000000000000");
+		InitGlyph(" ", "000000000000000000000000");
+		InitGlyph(83X, "440038443C44443C00000000"); (* ä *)
+		InitGlyph(84X, "440038444444443800000000");  (* ö *)
+		InitGlyph(85X, "440044444444443C00000000") (* ü *)
+	END InitializeGlyphs;
+	
+	PROCEDURE WriteCharacter*(VAR view: View; char: CHAR; color: Color);
+	BEGIN
+		Processors.AcquireLock(lock);
+		Write(view, char, color);
+		Processors.ReleaseLock(lock)
+	END WriteCharacter;
+	
+	PROCEDURE WriteText*(VAR view: View; t: ARRAY OF CHAR; color: Color);
+	VAR i, len: LONGINT;
+	BEGIN
+		Processors.AcquireLock(lock);
+		i := 0; len := LEN(t);
+		WHILE (i < len) & (t[i] # 0X) DO Write(view, t[i], color); INC(i) END;
+		Processors.ReleaseLock(lock)
+	END WriteText;
+
+	PROCEDURE WriteInteger*(VAR view: View; x: LONGINT; color: Color);
+	CONST MinLongInt = "-2147483648";
+	VAR x0, i: LONGINT; a: ARRAY 12 OF CHAR;
+	BEGIN
+		IF x < 0 THEN
+			IF x = MIN(LONGINT) THEN
+				WriteText(view, MinLongInt, color);
+				RETURN
+			ELSE x0 := -x
+			END
+		ELSE x0 := x
+		END;
+		i := 0;
+		REPEAT
+			a[i] := CHR(x0 MOD 10 + 30H); x0 := x0 DIV 10; INC(i)
+		UNTIL x0 = 0;
+		Processors.AcquireLock(lock);
+		IF x < 0 THEN Write(view, "-", color) END;
+		REPEAT DEC(i); Write(view, a[i], color) UNTIL i = 0;
+		Processors.ReleaseLock(lock)
+	END WriteInteger;
+	
+	PROCEDURE WriteHex*(VAR view: View; x: LONGINT; color: Color);
+	CONST HexLen = 8;
+	VAR i: LONGINT; a: ARRAY 10 OF CHAR;
+	BEGIN
+		Processors.AcquireLock(lock);
+		FOR i := HexLen-1 TO 0 BY -1 DO
+			a[i] := CHR(x MOD 10H + 30H); 
+			IF a[i] > "9" THEN
+				a[i] := CHR(ORD(a[i]) - 30H + 41H - 10)
+			END;
+			x := x DIV 10H;
+		END;
+		a[HexLen] := "H";
+		FOR i := 0 TO HexLen DO Write(view, a[i], color) END;
+		Processors.ReleaseLock(lock)
+	END WriteHex;
+	
+	PROCEDURE WriteCardinal*(VAR view: View; x: CARDINAL; color: Color);
+	VAR i: LONGINT; a: ARRAY 12 OF CHAR;
+	BEGIN
+		Processors.AcquireLock(lock);
+		i := 0;
+		REPEAT
+			a[i] := CHR(SIGNED(x MOD 10) + 30H); x := x DIV 10; INC(i)
+		UNTIL x = 0;
+		REPEAT DEC(i); Write(view, a[i], color) UNTIL i = 0;
+		Processors.ReleaseLock(lock)
+	END WriteCardinal;
+	
+	PROCEDURE WriteHexCardinal*(VAR view: View; x: CARDINAL; color: Color);
+	BEGIN WriteHex(view, SYSTEM.VAL(LONGINT, x), color)
+	END WriteHexCardinal;
+		
+	PROCEDURE WriteLine*(VAR view: View);
+	BEGIN
+		Processors.AcquireLock(lock);
+		Write(view, 0DX, Black); (* CR *); Write(view, 0AX, Black); (* LF *)
+		Processors.ReleaseLock(lock)
+	END WriteLine;
+	
+	(** Standard Output *)
+				
+	PROCEDURE Character*(c: CHAR);
+	BEGIN WriteCharacter(standardOutput, c, Black)
+	END Character;
+	
+	PROCEDURE Text*(t: ARRAY OF CHAR);
+	BEGIN WriteText(standardOutput, t, Black)
+	END Text;
+	
+	PROCEDURE Integer*(x: LONGINT);
+	BEGIN WriteInteger(standardOutput, x, Black)
+	END Integer;
+	
+	PROCEDURE Hex*(x: LONGINT);
+	BEGIN WriteHex(standardOutput, x, Black)
+	END Hex;
+	
+	PROCEDURE Cardinal*(x: CARDINAL);
+	BEGIN WriteCardinal(standardOutput, x, Black)
+	END Cardinal;
+	
+	PROCEDURE HexCardinal*(x: CARDINAL);
+	BEGIN WriteHexCardinal(standardOutput, x, Black)
+	END HexCardinal;
+	
+	PROCEDURE Line*;
+	BEGIN WriteLine(standardOutput)
+	END Line;
+	
+	BEGIN
+		Processors.InitializeLock(lock);
+		InitializeMode;
+		InitializeGlyphs; 
+		InitializeScreen
+END Output.

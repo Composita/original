@@ -1,0 +1,968 @@
+MODULE ComLoader; (** Component Runtime System, Loader, 2007 by Luc Blaeser *)
+	IMPORT SYSTEM, Runtime := ComRuntime, CBC := ComBinaryCode, Basic := ComBasic, Concurrency;
+
+	TYPE
+		(** abstract reader *)
+		Reader* = OBJECT
+			PROCEDURE Position*(): LONGINT;
+			BEGIN HALT(99) (* abstract *)
+			END Position;
+			
+			PROCEDURE Length*(): LONGINT;
+			BEGIN HALT(99) (* abstract *)
+			END Length;
+			
+			PROCEDURE Read*(): CHAR;
+			BEGIN HALT(99)
+			END Read;
+			
+			PROCEDURE Free*;
+			END Free;
+		END Reader;
+			
+	CONST
+		MaxList = 1024;
+	
+	TYPE
+		Address = Runtime.Address;
+		
+	CONST
+		NilValue = Runtime.NilValue;
+		TrueValue = Runtime.TrueValue; 
+		FalseValue = Runtime.FalseValue;
+	
+	TYPE
+		UsedComponent* = OBJECT
+			VAR 
+				name-: Basic.String;
+				offeredInterfaces, requiredInterfaces: Runtime.InterfaceDeclarationList;
+				
+			PROCEDURE &InitUsedComponent*(id: Basic.String);
+			BEGIN name := id; NEW(offeredInterfaces); NEW(requiredInterfaces)
+			END InitUsedComponent;
+			
+			PROCEDURE Free*;
+			BEGIN 
+				DELETE(name); 
+				offeredInterfaces.Free; DELETE(offeredInterfaces);
+				requiredInterfaces.Free; DELETE(requiredInterfaces)
+			END Free;
+			
+			PROCEDURE Compatible1*(x: Runtime.ComponentTemplate): BOOLEAN;
+			BEGIN
+				RETURN (x # NIL) & (x.name^ = name^) & 
+					offeredInterfaces.Equal(x.offeredInterfaces) &
+					requiredInterfaces.Equal(x.requiredInterfaces) 
+			END Compatible1;
+			
+			PROCEDURE Compatible2*(x: NewComponent): BOOLEAN;
+			BEGIN
+				RETURN (x # NIL) & (x.name^ = name^) &
+					offeredInterfaces.Equal(x.offeredInterfaces) &
+					requiredInterfaces.Equal(x.requiredInterfaces) 
+			END Compatible2;
+		END UsedComponent;
+		
+		UsedComponentList* = OBJECT(Basic.List)
+			PROCEDURE Add*(x: PTR);
+			BEGIN ASSERT(x IS UsedComponent); Add^(x)
+			END Add;
+			
+			PROCEDURE GetUsedComponent*(i: LONGINT): UsedComponent;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(i); RETURN ptr(UsedComponent)
+			END GetUsedComponent;
+			
+			PROCEDURE FindUsedComponent*(name: ARRAY OF CHAR): UsedComponent;
+			VAR i: LONGINT; x: UsedComponent;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetUsedComponent(i);
+					IF x.name^ = name THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindUsedComponent;
+			
+			PROCEDURE Free*;
+			VAR i: LONGINT; x: UsedComponent;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetUsedComponent(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END UsedComponentList;
+	
+		NewComponent* = OBJECT
+			VAR 
+				unit: CompilationUnit;
+				name-: Basic.String;
+				offeredInterfaces, requiredInterfaces: Runtime.InterfaceDeclarationList;
+				size: LONGINT;
+				initializerCodeOffset: LONGINT;
+				finalizerCodeOffset: LONGINT;
+				
+			PROCEDURE &InitNewComponent*(u: CompilationUnit; id: Basic.String);
+			BEGIN unit := u; name := id; NEW(offeredInterfaces); NEW(requiredInterfaces)
+			END InitNewComponent;
+			
+			PROCEDURE Free*;
+			BEGIN
+				DELETE(name); 
+				IF offeredInterfaces # NIL THEN offeredInterfaces.Free; DELETE(offeredInterfaces) END;
+				IF requiredInterfaces # NIL THEN requiredInterfaces.Free; DELETE(requiredInterfaces) END
+			END Free;
+			
+			PROCEDURE Clear*;
+			BEGIN offeredInterfaces := NIL; requiredInterfaces := NIL
+			END Clear;
+		END NewComponent;
+		
+		NewComponentList* = OBJECT(Basic.List)
+			PROCEDURE Add*(x: PTR);
+			BEGIN ASSERT(x IS NewComponent); Add^(x)
+			END Add;
+			
+			PROCEDURE GetNewComponent*(i: LONGINT): NewComponent;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(i); RETURN ptr(NewComponent)
+			END GetNewComponent;
+			
+			PROCEDURE FindNewComponent*(name: ARRAY OF CHAR): NewComponent;
+			VAR i: LONGINT; x: NewComponent;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetNewComponent(i);
+					IF x.name^ = name THEN RETURN x END
+				END;
+				RETURN NIL
+			END FindNewComponent;
+			
+			PROCEDURE Free*;
+			VAR i: LONGINT; x: NewComponent;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetNewComponent(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END NewComponentList;
+		
+		NamedFixup = OBJECT
+			VAR 
+				name: Basic.String;
+				fixups: Basic.LongIntList;
+				
+			PROCEDURE &InitNamedFixup(defName: Basic.String; fixupList: Basic.LongIntList);
+			BEGIN name := defName; fixups := fixupList
+			END InitNamedFixup;
+			
+			PROCEDURE Free;
+			BEGIN DELETE(name); fixups.Free; DELETE(fixups)
+			END Free;
+		END NamedFixup;
+		
+		NamedFixupList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS NamedFixup); Add^(x)
+			END Add;
+			
+			PROCEDURE GetNamedFixup(index: LONGINT): NamedFixup;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(NamedFixup)
+			END GetNamedFixup;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; x: NamedFixup;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetNamedFixup(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END NamedFixupList;
+	
+		CompilationUnit = OBJECT
+			VAR
+				name: Basic.String;
+				constants: Basic.RawSection;
+				code: Basic.RawSection;
+				templateFixups: NamedFixupList;
+				interfaceFixups: NamedFixupList;
+
+			PROCEDURE &InitCompilationUnit(id: ARRAY OF CHAR);
+			BEGIN name := Basic.NewString(id); constants := NIL; code := NIL; templateFixups := NIL; interfaceFixups := NIL
+			END InitCompilationUnit;
+			
+			PROCEDURE Free;
+			BEGIN
+				DELETE(name); 
+				(* constant or code are set to NIL if installed in Runtime *)
+				IF constants # NIL THEN DELETE(constants) END;
+				IF code # NIL THEN DELETE(code) END;
+				IF templateFixups # NIL THEN templateFixups.Free; DELETE(templateFixups) END;
+				IF interfaceFixups # NIL THEN interfaceFixups.Free; DELETE(interfaceFixups) END
+			END Free;
+		END CompilationUnit;
+		
+		CompilationUnitList = OBJECT(Basic.List)
+			PROCEDURE Add(x: PTR);
+			BEGIN ASSERT(x IS CompilationUnit); Add^(x)
+			END Add;
+			
+			PROCEDURE GetCompilationUnit(index: LONGINT): CompilationUnit;
+			VAR ptr: PTR;
+			BEGIN ptr := GetItem(index); RETURN ptr(CompilationUnit)
+			END GetCompilationUnit;
+			
+			PROCEDURE Free;
+			VAR i: LONGINT; x: CompilationUnit;
+			BEGIN
+				FOR i := 0 TO Length()-1 DO
+					x := GetCompilationUnit(i); x.Free
+				END;
+				x := NIL;
+				Free^
+			END Free;
+		END CompilationUnitList;
+	
+	VAR
+		usedInterfaces-: Runtime.InterfaceSpecificationList;
+		usedComponents-: UsedComponentList;
+		newInterfaces-: Runtime.InterfaceSpecificationList;
+		newComponents-: NewComponentList;
+		compilationUnits: CompilationUnitList;
+		reader: Reader; length: LONGINT; 
+		char: CHAR; position: LONGINT; error-: BOOLEAN;
+
+	PROCEDURE Initialize*;
+	BEGIN 
+		ASSERT(usedInterfaces = NIL); ASSERT(usedComponents = NIL);
+		ASSERT(newInterfaces = NIL); ASSERT(newComponents = NIL); 
+		ASSERT(compilationUnits = NIL);
+		NEW(usedInterfaces); NEW(usedComponents);
+		NEW(newInterfaces); NEW(newComponents); 
+		NEW(compilationUnits); error := FALSE
+	END Initialize;
+
+	PROCEDURE PreLoad*(name: ARRAY OF CHAR; input: Reader);
+	VAR unit: CompilationUnit;
+	BEGIN
+		reader := input; length := reader.Length(); 
+		position := 0; Next;
+		NEW(unit, name); compilationUnits.Add(unit);
+		ParseFile(unit);
+		reader := NIL
+	END PreLoad;
+	
+	PROCEDURE Commit*;
+	VAR i: LONGINT; newCom: NewComponent; interface: Runtime.InterfaceSpecification; 
+		comTemplate: Runtime.ComponentTemplate; unit: CompilationUnit;
+	BEGIN
+		ASSERT(~error);
+		ASSERT(usedInterfaces.Length() = 0); ASSERT(usedComponents.Length() = 0);
+		FOR i := 0 TO newInterfaces.Length()-1 DO
+			interface := newInterfaces.GetInterfaceSpecification(i);
+			Runtime.RegisterInterfaceSpecification(interface)
+		END;
+		interface := NIL;
+		newInterfaces.Clear;
+		FOR i := 0 TO newComponents.Length()-1 DO
+			 newCom := newComponents.GetNewComponent(i);
+			 unit := newCom.unit;
+			 NEW(comTemplate, newCom.name^, 
+			 	newCom.offeredInterfaces, newCom.requiredInterfaces, newCom.size, 
+			 	StaticBase(unit.code) + newCom.initializerCodeOffset, 
+			 	StaticBase(unit.code) + newCom.finalizerCodeOffset);
+			 Runtime.RegisterComponentTemplate(comTemplate);
+			 newCom.Clear
+		END;
+		newCom := NIL;
+		FOR i := 0 TO compilationUnits.Length()-1 DO
+			unit := compilationUnits.GetCompilationUnit(i);
+			IF LEN(unit.constants) > 0 THEN
+				Runtime.RegisterConst(unit.constants);
+				unit.constants := NIL
+			END;
+			ResolveTemplateFixups(unit);
+			ResolveInterfaceFixups(unit);
+			IF LEN(unit.code) > 0 THEN
+				Runtime.RegisterCode(unit.name^, unit.code);
+				unit.code := NIL
+			END
+		END;
+		unit := NIL;
+		Free
+	END Commit;
+	
+	PROCEDURE Free;
+	BEGIN
+		IF reader # NIL THEN reader.Free; DELETE(reader) END;
+		length := 0; position := 0; error := FALSE; 
+		IF usedInterfaces # NIL THEN usedInterfaces.Free; DELETE(usedInterfaces) END;
+		IF usedComponents # NIL THEN usedComponents.Free; DELETE(usedComponents) END;
+		IF newInterfaces # NIL THEN newInterfaces.Free; DELETE(newInterfaces) END;
+		IF newComponents # NIL THEN newComponents.Free; DELETE(newComponents) END;
+		IF compilationUnits # NIL THEN compilationUnits.Free; DELETE(compilationUnits) END
+	END Free;
+	
+	PROCEDURE ResolveTemplateFixups(unit: CompilationUnit);
+	VAR i: LONGINT; templateFixup: NamedFixup; template: Runtime.ComponentTemplate;
+	BEGIN
+		FOR i := 0 TO unit.templateFixups.Length()-1 DO
+			templateFixup := unit.templateFixups.GetNamedFixup(i);
+			template := Runtime.FindComponentTemplate(templateFixup.name^);
+			ASSERT(template # NIL); 
+			FixupList(unit, templateFixup.fixups, SYSTEM.VAL(Address, template))
+		END
+	END ResolveTemplateFixups;
+	
+	PROCEDURE ResolveInterfaceFixups(unit: CompilationUnit);
+	VAR i: LONGINT; interfaceFixup: NamedFixup; interface: Runtime.InterfaceSpecification;
+	BEGIN
+		FOR i := 0 TO unit.interfaceFixups.Length()-1 DO
+			interfaceFixup := unit.interfaceFixups.GetNamedFixup(i);
+			interface := Runtime.FindInterfaceSpecification(interfaceFixup.name^);
+			ASSERT(interface # NIL);
+			FixupList(unit, interfaceFixup.fixups, SYSTEM.VAL(Address, interface))
+		END
+	END ResolveInterfaceFixups;
+	
+	PROCEDURE FixupList(unit: CompilationUnit; fixups: Basic.LongIntList; fixupValue: Address);
+	VAR i: LONGINT; fixupAdr: Address;
+	BEGIN
+		FOR i := 0 TO fixups.Length()-1 DO
+			fixupAdr := StaticBase(unit.code) + fixups.GetItem(i);
+			Fixup(fixupAdr, fixupValue)
+		END
+	END FixupList;
+		
+	PROCEDURE Abort*;
+	BEGIN Free
+	END Abort;
+		
+	PROCEDURE ParseFile(unit: CompilationUnit);
+	BEGIN 
+		Check(CBC.FTag, "FTag missing"); Check(CBC.FVersion, "Wrong version");
+		ParseUsedInterfaceList;
+		ParseUsedComponentList;
+		ParseNewInterfaceList;
+		ParseNewComponentList(unit);
+		ParseConstants(unit);
+		ParseCode(unit); 
+		ParseFixupSection(unit);
+		IF position # length THEN Error("File end expected") END
+	END ParseFile;
+	
+	PROCEDURE ParseUsedInterfaceList;
+	VAR nofInterfaces, i: LONGINT; interface: Runtime.InterfaceSpecification;
+	BEGIN
+nofInterfaces := Integer4();
+		IF nofInterfaces > MaxList THEN 
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofInterfaces-1 DO
+				interface := ParseInterfaceSpecification();
+				usedInterfaces.Add(interface)
+			END
+		END
+	END ParseUsedInterfaceList;
+	
+	PROCEDURE ParseNewInterfaceList;
+	VAR nofInterfaces, i: LONGINT; interface: Runtime.InterfaceSpecification;
+	BEGIN
+		nofInterfaces := Integer4();
+		IF nofInterfaces > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofInterfaces-1 DO
+				interface := ParseInterfaceSpecification();
+				ParseRawSection(interface.protocolStateMatrix);
+				newInterfaces.Add(interface);
+			END
+		END
+	END ParseNewInterfaceList;
+	
+	PROCEDURE ParseInterfaceSpecification(): Runtime.InterfaceSpecification;
+	VAR name: Basic.String; code: LONGINT; interface: Runtime.InterfaceSpecification; 
+		messageDeclarations: Runtime.MessageDeclarationList;
+	BEGIN
+		name := Text(); code := 0;
+		messageDeclarations := ParseMessageDeclList(code);
+		ParseProtocol(code);
+		NEW(interface, name^, messageDeclarations, code);
+		DELETE(name);
+		RETURN interface
+	END ParseInterfaceSpecification;
+	
+	PROCEDURE ParseMessageDeclList(VAR code: LONGINT): Runtime.MessageDeclarationList;
+	VAR i: LONGINT; nofMessages: LONGINT; list: Runtime.MessageDeclarationList; md: Runtime.MessageDeclaration;
+	BEGIN
+		NEW(list);
+		nofMessages := Integer4();
+		IF nofMessages > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofMessages-1 DO
+				code := code * 3;
+				md := ParseMessageDeclaration(code);
+				list.Add(md)
+			END
+		END;
+		RETURN list
+	END ParseMessageDeclList;
+	
+	PROCEDURE ParseMessageDeclaration(VAR code: LONGINT): Runtime.MessageDeclaration;
+	VAR in: BOOLEAN; name: Basic.String; md: Runtime.MessageDeclaration;
+	BEGIN
+		IF char = CBC.FIn THEN Next; in := TRUE ELSE Check(CBC.FOut, "FIn or FOut epected"); in := FALSE END;
+		name := Text();
+		NEW(md, name^);
+		code := code * 5 + EncodeName(name^); IF in THEN INC(code) END;
+		ParseParameterList(md.parameterTypes, code);
+		DELETE(name);
+		RETURN md
+	END ParseMessageDeclaration;
+	
+	PROCEDURE EncodeName(name: ARRAY OF CHAR): LONGINT;
+	VAR code, i: LONGINT;
+	BEGIN code := 0; FOR i := 0 TO LEN(name)-1 DO code := 80 * code + ORD(name[i]) END; RETURN code
+	END EncodeName;
+
+	PROCEDURE ParseParameterList(parTypeList: Runtime.TypeList; VAR code: LONGINT);
+	VAR nofParameters, i, type: LONGINT;
+	BEGIN
+		nofParameters := Integer4();
+		IF nofParameters > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofParameters-1 DO
+				code := code * 7;
+				type := ParseType(code);
+				parTypeList.Add(type)
+			END
+		END
+	END ParseParameterList;
+	
+	PROCEDURE ParseType(VAR code: LONGINT): LONGINT;
+	VAR name: Basic.String; list: Runtime.InterfaceDeclarationList;
+	BEGIN
+		IF char = CBC.FCharacterType THEN 
+			Next; INC(code, 1); RETURN Runtime.CharacterTypeCode
+		ELSIF char = CBC.FBooleanType THEN 
+			Next; INC(code, 2); RETURN Runtime.BooleanTypeCode
+		ELSIF char = CBC.FIntegerType THEN 
+			Next; INC(code, 3); RETURN Runtime.IntegerTypeCode
+		ELSIF char = CBC.FRealType THEN 
+			Next; INC(code, 4); RETURN Runtime.RealTypeCode
+		ELSIF char = CBC.FTextType THEN 
+			Next; INC(code, 5); RETURN Runtime.TextTypeCode
+		ELSIF char = CBC.FComponentType THEN
+			Next; code := code * 11;
+			name := Text(); 
+			INC(code, EncodeName(name^));
+			DELETE(name);
+			RETURN Runtime.ComponentTypeCode
+		ELSIF char = CBC.FAnyType THEN
+			Next; code := code * 13;
+			NEW(list); ParseOfferedInterfaces(list); 
+			INC(code, EncodeInterfaceDeclList(list)); code := code * 17;
+			NEW(list); ParseRequiredInterfaces(list); code := code * 17;
+			INC(code, EncodeInterfaceDeclList(list));
+			RETURN Runtime.ComponentTypeCode
+		ELSE
+			Error("Invalid type");
+			RETURN 0
+		END
+	END ParseType;
+	
+	PROCEDURE EncodeInterfaceDeclList(list: Runtime.InterfaceDeclarationList): LONGINT;
+	VAR i, code: LONGINT; interface: Runtime.InterfaceDeclaration;
+	BEGIN
+		code := 0;
+		FOR i := 0 TO list.Length()-1 DO
+			interface := list.GetInterfaceDeclaration(i);
+			code := 19 * code + EncodeName(interface.name^) + interface.minNumber * 23 + interface.maxNumber * 29
+		END;
+		RETURN code
+	END EncodeInterfaceDeclList;
+	
+	PROCEDURE ParseProtocol(VAR code: LONGINT);
+	BEGIN
+		IF char = CBC.FNoProtocol THEN Next
+		ELSE ParseProtocolExpr(code)
+		END
+	END ParseProtocol;
+	
+	PROCEDURE ParseProtocolExpr(VAR code: LONGINT);
+	VAR index: LONGINT;
+	BEGIN
+		IF char = CBC.FMessageDecl THEN 
+			Next; 
+			index := Integer4(); code := code * 31 + index
+		ELSIF char = CBC.FSequence THEN
+			Next; 
+			code := code * 37;
+			ParseProtocolExpr(code); 
+			code := code * 41;
+			ParseProtocolExpr(code)
+		ELSIF char = CBC.FAlternative THEN
+			Next;
+			code := code * 43;
+			ParseProtocolExpr(code);
+			code := code * 47;
+			ParseProtocolExpr(code)
+		ELSIF char = CBC.FRepetition  THEN
+			Next;
+			code := code * 51;
+			ParseProtocolExpr(code)
+		ELSIF char = CBC.FOption THEN
+			Next;
+			code := code * 53;
+			ParseProtocolExpr(code)
+		ELSE 
+			Error("Invalid protocol")
+		END
+	END ParseProtocolExpr;
+	
+	PROCEDURE ParseOfferedInterfaces(list: Runtime.InterfaceDeclarationList);
+	VAR nofInterfaces, i: LONGINT; name: Basic.String; interface: Runtime.InterfaceDeclaration;
+	BEGIN
+		nofInterfaces := Integer4();
+		IF nofInterfaces > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofInterfaces-1 DO
+				name := Text();
+				NEW(interface, name^, 1, 1);
+				DELETE(name);
+				list.Add(interface)
+			END
+		END
+	END ParseOfferedInterfaces;
+	
+	PROCEDURE ParseRequiredInterfaces(list: Runtime.InterfaceDeclarationList);
+	VAR nofInterfaces, i, min, max: LONGINT; name: Basic.String; interface: Runtime.InterfaceDeclaration;
+	BEGIN
+		nofInterfaces := Integer4(); 
+		IF nofInterfaces > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofInterfaces-1 DO
+				name := Text(); min := Integer4(); max := Integer4();
+				NEW(interface, name^, min, max);
+				DELETE(name);
+				list.Add(interface)
+			END
+		END
+	END ParseRequiredInterfaces;
+	
+	PROCEDURE ParseUsedComponentList;
+	VAR nofComponents, i: LONGINT;
+	BEGIN
+		nofComponents := Integer4();
+		IF nofComponents > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofComponents-1 DO
+				ParseUsedComponent
+			END
+		END
+	END ParseUsedComponentList;
+	
+	PROCEDURE ParseUsedComponent;
+	VAR name: Basic.String; usedCom: UsedComponent;
+	BEGIN
+		name := Text();
+		NEW(usedCom, name);
+		ParseOfferedInterfaces(usedCom.offeredInterfaces);
+		ParseRequiredInterfaces(usedCom.requiredInterfaces);
+		usedComponents.Add(usedCom)
+	END ParseUsedComponent;
+		
+	PROCEDURE ParseNewComponentList(unit: CompilationUnit);
+	VAR nofComponents, i: LONGINT;
+	BEGIN
+		nofComponents := Integer4();
+		IF nofComponents > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO nofComponents-1 DO
+				ParseNewComponent(unit)
+			END
+		END
+	END ParseNewComponentList;
+	
+	PROCEDURE ParseNewComponent(unit: CompilationUnit);
+	VAR name: Basic.String; size, initCodeOfs, finalCodeOfs: LONGINT; newCom: NewComponent;
+	BEGIN
+		name := Text(); 
+		NEW(newCom, unit, name);
+		ParseOfferedInterfaces(newCom.offeredInterfaces);
+		ParseRequiredInterfaces(newCom.requiredInterfaces);
+		newCom.size := Integer4();
+		newCom.initializerCodeOffset := Integer4();
+		newCom.finalizerCodeOffset := Integer4();
+		newComponents.Add(newCom)
+	END ParseNewComponent;
+	
+	PROCEDURE ParseConstants(unit: CompilationUnit);
+	BEGIN ParseRawSection(unit.constants)
+	END ParseConstants;
+	
+	PROCEDURE ParseCode(unit: CompilationUnit);
+	BEGIN ParseRawSection(unit.code)
+	END ParseCode;
+	
+	PROCEDURE ParseRawSection(VAR section: Basic.RawSection);
+	VAR length, i: LONGINT;
+	BEGIN 
+		length := Integer4(); 
+		IF length >= 0 THEN
+			NEW(section, length);
+			FOR i := 0 TO length-1 DO
+				section[i] := Char()
+			END
+		ELSE Error("Negative section length")
+		END
+	END ParseRawSection;
+	
+	PROCEDURE ParseFixupSection(unit: CompilationUnit);
+	VAR nofLists, i: LONGINT;
+	BEGIN
+		ParseLocalConstFixups(unit);
+		ParseLocalCodeFixups(unit);
+		nofLists := Integer4();
+		FOR i := 0 TO nofLists-1 DO
+			ParseSystemCallFixups(unit)
+		END;
+		NEW(unit.templateFixups);
+		nofLists := Integer4();
+		FOR i := 0 TO nofLists-1 DO
+			ParseNamedFixups(unit.templateFixups)
+		END;
+		NEW(unit.interfaceFixups);
+		nofLists := Integer4();
+		FOR i := 0 TO nofLists-1 DO
+			ParseNamedFixups(unit.interfaceFixups)
+		END
+	END ParseFixupSection;
+	
+	PROCEDURE ParseLocalConstFixups(unit: CompilationUnit);
+	VAR fixups: Basic.LongIntList; i: LONGINT; fixupAdr, fixupValue: Address;
+	BEGIN
+		fixups := ParseFixupList();
+		FOR i := 0 TO fixups.Length()-1 DO
+			fixupAdr := StaticBase(unit.code) + fixups.GetItem(i);
+			fixupValue := StaticBase(unit.constants);
+			Fixup(fixupAdr, fixupValue)
+		END;
+		fixups.Free; DELETE(fixups)
+	END ParseLocalConstFixups;
+	
+	PROCEDURE ParseLocalCodeFixups(unit: CompilationUnit);
+	VAR fixups: Basic.LongIntList; i: LONGINT; fixupAdr, fixupValue: Address;
+	BEGIN
+		fixups := ParseFixupList();
+		FOR i := 0 TO fixups.Length()-1 DO
+			fixupAdr := StaticBase(unit.code) + fixups.GetItem(i);
+			fixupValue := StaticBase(unit.code);
+			Fixup(fixupAdr, fixupValue)
+		END;
+		fixups.Free; DELETE(fixups)
+	END ParseLocalCodeFixups;
+	
+	PROCEDURE ParseSystemCallFixups(unit: CompilationUnit);
+	VAR sysCallCode, relAbsCode: CHAR; relative: BOOLEAN; fixups: Basic.LongIntList; 
+		targetAdr, fixupAdr, fixupValue: Address; i: LONGINT;
+	BEGIN
+		sysCallCode := Char(); relAbsCode := Char();
+		IF relAbsCode = CBC.FRelative THEN relative := TRUE
+		ELSIF relAbsCode = CBC.FAbsolute THEN relative := FALSE
+		ELSE Error("FRelative or FAbsolute expected")
+		END;
+		fixups := ParseFixupList();
+		targetAdr := SystemCallAddress(sysCallCode);
+		FOR i := 0 TO fixups.Length()-1 DO
+			fixupAdr := StaticBase(unit.code) + fixups.GetItem(i);
+			IF relative THEN
+				fixupValue := targetAdr - (fixupAdr + 4)
+			ELSE
+				fixupValue := targetAdr
+			END;
+			Fixup(fixupAdr, fixupValue)
+		END;
+		fixups.Free; DELETE(fixups)
+	END ParseSystemCallFixups;
+	
+	PROCEDURE ParseNamedFixups(list: NamedFixupList);
+	VAR name: Basic.String; fixups: Basic.LongIntList; namedFixup: NamedFixup;
+	BEGIN
+		name := Text();
+		fixups := ParseFixupList();
+		NEW(namedFixup, name, fixups); 
+		list.Add(namedFixup)
+	END ParseNamedFixups;
+		
+	PROCEDURE StaticBase(section: Basic.RawSection): Address;
+	BEGIN RETURN SYSTEM.ADR(section[0])
+	END StaticBase;
+		
+	PROCEDURE SystemCallAddress(code: CHAR): Address;
+	VAR adr: Address;
+	BEGIN
+		adr := NilValue;
+		IF code = CBC.FWriteCharacter THEN
+			adr := SYSTEM.ADR(Runtime.WriteCharacter)
+		ELSIF code = CBC.FWriteInteger THEN
+			adr := SYSTEM.ADR(Runtime.WriteInteger)
+		ELSIF code = CBC.FWriteHex THEN
+			adr := SYSTEM.ADR(Runtime.WriteHex)
+		ELSIF code = CBC.FWriteReal THEN
+			adr := SYSTEM.ADR(Runtime.WriteReal)
+		ELSIF code = CBC.FWriteText THEN
+			adr := SYSTEM.ADR(Runtime.WriteText)
+		ELSIF code = CBC.FWriteLine THEN
+			adr := SYSTEM.ADR(Runtime.WriteLine)
+		ELSIF code = CBC.FCreateText THEN
+			adr := SYSTEM.ADR(Runtime.CreateText)
+		ELSIF code = CBC.FDeleteText THEN
+			adr := SYSTEM.ADR(Runtime.DeleteText)
+		ELSIF code = CBC.FCopyText THEN
+			adr := SYSTEM.ADR(Runtime.CopyText)
+		ELSIF code = CBC.FEqualText THEN
+			adr := SYSTEM.ADR(Runtime.EqualText)
+		ELSIF code = CBC.FLessText THEN
+			adr := SYSTEM.ADR(Runtime.LessText)
+		ELSIF code = CBC.FLessEqualText THEN
+			adr := SYSTEM.ADR(Runtime.LessEqualText)
+		ELSIF code = CBC.FSetTextLength THEN
+			adr := SYSTEM.ADR(Runtime.SetTextLength)
+		ELSIF code = CBC.FSelectTextCharacter THEN
+			adr := SYSTEM.ADR(Runtime.SelectTextCharacter)
+		ELSIF code = CBC.FTextLength THEN
+			adr := SYSTEM.ADR(Runtime.TextLength)
+		ELSIF code = CBC.FCharacterToText THEN
+			adr := SYSTEM.ADR(Runtime.CharacterToText)
+		ELSIF code = CBC.FCreateProcess THEN
+			adr := SYSTEM.ADR(Runtime.CreateProcess)
+		ELSIF code = CBC.FDeleteProcess THEN
+			adr := SYSTEM.ADR(Runtime.DeleteProcess)
+		ELSIF code = CBC.FCreateComponent THEN
+			adr := SYSTEM.ADR(Runtime.CreateComponent)
+		ELSIF code = CBC.FFinalizeComponent THEN
+			adr := SYSTEM.ADR(Runtime.FinalizeComponent)
+		ELSIF code = CBC.FDeleteComponent THEN
+			adr := SYSTEM.ADR(Runtime.DeleteComponent)
+		ELSIF code = CBC.FAttachComponent THEN
+			adr := SYSTEM.ADR(Runtime.AttachComponent)
+		ELSIF code = CBC.FDetachComponent THEN
+			adr := SYSTEM.ADR(Runtime.DetachComponent)
+		ELSIF code = CBC.FPreempt THEN
+			adr := SYSTEM.ADR(Runtime.Preempt)
+		ELSIF code = CBC.FExtendStack THEN
+			adr := SYSTEM.ADR(Concurrency.ExtendStack)
+		ELSIF code = CBC.FReduceStack THEN
+			adr := SYSTEM.ADR(Concurrency.ReduceStack)
+		ELSIF code = CBC.FCreateCollection THEN
+			adr := SYSTEM.ADR(Runtime.CreateCollection)
+		ELSIF code = CBC.FDeleteCollection THEN
+			adr := SYSTEM.ADR(Runtime.DeleteCollection)
+		ELSIF code = CBC.FCreateElement THEN
+			adr := SYSTEM.ADR(Runtime.CreateElement)
+		ELSIF code = CBC.FSelectElement THEN
+			adr := SYSTEM.ADR(Runtime.SelectElement)
+		ELSIF code = CBC.FExistsElement THEN
+			adr := SYSTEM.ADR(Runtime.ExistsElement)
+		ELSIF code = CBC.FDeleteElement THEN
+			adr := SYSTEM.ADR(Runtime.DeleteElement)
+		ELSIF code = CBC.FForeachStart THEN
+			adr := SYSTEM.ADR(Runtime.ForeachStart)
+		ELSIF code = CBC.FForeachContinue THEN
+			adr := SYSTEM.ADR(Runtime.ForeachContinue)
+		ELSIF code = CBC.FForeachGetKey THEN
+			adr := SYSTEM.ADR(Runtime.ForeachGetKey)
+		ELSIF code = CBC.FForeachGetValue THEN
+			adr := SYSTEM.ADR(Runtime.ForeachGetValue)
+		ELSIF code = CBC.FForeachNext THEN
+			adr := SYSTEM.ADR(Runtime.ForeachNext)
+		ELSIF code = CBC.FConnect THEN
+			adr := SYSTEM.ADR(Runtime.Connect)
+		ELSIF code = CBC.FDisconnect THEN
+			adr := SYSTEM.ADR(Runtime.Disconnect)
+		ELSIF code = CBC.FAwaitDisconnected THEN
+			adr := SYSTEM.ADR(Runtime.AwaitDisconnected)
+		ELSIF code = CBC.FSelectInterface THEN
+			adr := SYSTEM.ADR(Runtime.SelectInterface)
+		ELSIF code = CBC.FCountConnections THEN
+			adr := SYSTEM.ADR(Runtime.CountConnections)
+		ELSIF code = CBC.FCreateConnectionList THEN
+			adr := SYSTEM.ADR(Runtime.CreateConnectionList)
+		ELSIF code = CBC.FDeleteConnectionList THEN
+			adr := SYSTEM.ADR(Runtime.DeleteConnectionList)
+		ELSIF code = CBC.FSelectIndexedConnection THEN
+			adr := SYSTEM.ADR(Runtime.SelectIndexedConnection)
+		ELSIF code = CBC.FCreateCommBufferList THEN
+			adr := SYSTEM.ADR(Runtime.CreateCommBufferList)
+		ELSIF code = CBC.FDeleteCommBufferList THEN
+			adr := SYSTEM.ADR(Runtime.DeleteCommBufferList)
+		ELSIF code = CBC.FSelectIndexedCommunication THEN
+			adr := SYSTEM.ADR(Runtime.SelectIndexedCommunication)
+		ELSIF code = CBC.FCloseCommunicationList THEN
+			adr := SYSTEM.ADR(Runtime.CloseCommunicationList)
+		ELSIF code = CBC.FAwaitMessage THEN
+			adr := SYSTEM.ADR(Runtime.AwaitMessage)
+		ELSIF code = CBC.FSelectFromCommSet THEN
+			adr := SYSTEM.ADR(Runtime.SelectFromCommSet)
+		ELSIF code = CBC.FCloseAndDeleteCommSet THEN
+			adr := SYSTEM.ADR(Runtime.CloseAndDeleteCommSet)
+		ELSIF code = CBC.FOpenCommunication THEN
+			adr := SYSTEM.ADR(Runtime.OpenCommunication)
+		ELSIF code = CBC.FCloseCommunication THEN
+			adr := SYSTEM.ADR(Runtime.CloseCommunication)
+		ELSIF code = CBC.FWaitToSend THEN
+			adr := SYSTEM.ADR(Runtime.WaitToSend)
+		ELSIF code = CBC.FWaitToReceive THEN
+			adr := SYSTEM.ADR(Runtime.WaitToReceive)
+		ELSIF code = CBC.FCompleteSend THEN
+			adr := SYSTEM.ADR(Runtime.CompleteSend)
+		ELSIF code = CBC.FCompleteReceive THEN
+			adr := SYSTEM.ADR(Runtime.CompleteReceive)
+		ELSIF code = CBC.FInputMessage THEN
+			adr := SYSTEM.ADR(Runtime.InputMessage)
+		ELSIF code = CBC.FInterfaceTest THEN
+			adr := SYSTEM.ADR(Runtime.InterfaceTest)
+		ELSIF code = CBC.FInitCommunicationBuffer THEN
+			adr := SYSTEM.ADR(Runtime.InitializeCommunicationBuffer)
+		ELSIF code = CBC.FRandom THEN
+			adr := SYSTEM.ADR(Runtime.Random)
+		ELSIF code = CBC.FArcSine THEN
+			adr := SYSTEM.ADR(Runtime.ArcSine)
+		ELSIF code = CBC.FArcCosine THEN
+			adr := SYSTEM.ADR(Runtime.ArcCosine)
+		ELSIF code = CBC.FAwaitInitializationEnd THEN
+			adr := SYSTEM.ADR(Runtime.AwaitInitializationEnd)
+		ELSIF code = CBC.FAwaitFinalizationStart THEN
+			adr := SYSTEM.ADR(Runtime.AwaitFinalizationStart)
+		ELSIF code = CBC.FSignalExternal THEN
+			adr := SYSTEM.ADR(Runtime.SignalExternal)
+		ELSIF code = CBC.FCreateArray THEN
+			adr := SYSTEM.ADR(Runtime.CreateArray)
+		ELSIF code = CBC.FDeleteArray THEN
+			adr := SYSTEM.ADR(Runtime.DeleteArray)
+		ELSIF code = CBC.FPassivate THEN
+			adr := SYSTEM.ADR(Runtime.Passivate)
+		ELSIF code = CBC.FAwait THEN
+			adr := SYSTEM.ADR(Runtime.Await)
+		ELSIF code = CBC.FLock THEN
+			adr := SYSTEM.ADR(Runtime.Lock)
+		ELSIF code = CBC.FUnlock THEN
+			adr := SYSTEM.ADR(Runtime.Unlock)
+		ELSIF code = CBC.FVirtualTime THEN
+			adr := SYSTEM.ADR(Runtime.VirtualTime)
+		ELSE
+			Error("Undefined system call")
+		END;
+		RETURN adr
+	END SystemCallAddress;
+	
+	PROCEDURE Fixup(adr, val: Address);
+	VAR a: Basic.Integer4Byte; i, x: LONGINT;
+	BEGIN
+		FOR i := 0 TO LEN(a)-1 DO
+			SYSTEM.GET(adr + i, a[i])
+		END;
+		Basic.Decode4ByteInteger(a, x);
+		INC(x, SYSTEM.VAL(LONGINT, val));
+		Basic.Encode4ByteInteger(x, a);
+		FOR i := 0 TO LEN(a)-1 DO
+			SYSTEM.PUT8(adr + i, a[i])
+		END
+	END Fixup;
+	
+	PROCEDURE ParseFixupList(): Basic.LongIntList;
+	VAR length, i, x: LONGINT; list: Basic.LongIntList;
+	BEGIN
+		length := Integer4(); NEW(list);
+		IF length > MaxList THEN
+			Error("Too high number")
+		ELSE
+			FOR i := 0 TO length-1 DO
+				x := Integer4();
+				list.Add(x)
+			END
+		END;
+		RETURN list
+	END ParseFixupList;
+	
+	(* helper operation *)
+	
+	PROCEDURE Check(x: CHAR; text: ARRAY OF CHAR);
+	BEGIN IF char = x THEN Next ELSE Error(text) END
+	END Check;
+	
+	PROCEDURE Error(text: ARRAY OF CHAR);
+	BEGIN 
+		error := TRUE; position := length; char := 0X;
+		Basic.OutText("Error pos "); Basic.OutInteger(reader.Position()); Basic.OutText(" "); Basic.OutText(text); Basic.OutLine
+	END Error;
+	
+	PROCEDURE EOT(): BOOLEAN;
+	BEGIN RETURN length = position
+	END EOT;
+	
+	PROCEDURE Next;
+	BEGIN IF position < length THEN char := reader.Read(); INC(position) ELSE char := 0X END
+	END Next;
+	
+	PROCEDURE Char(): CHAR;
+	VAR x: CHAR;
+	BEGIN x := char; Next; RETURN x
+	END Char;
+	
+	PROCEDURE Integer1(): LONGINT;
+	VAR i: LONGINT;
+	BEGIN i := ORD(char); Next; RETURN i
+	END Integer1;
+	
+	PROCEDURE Integer4(): LONGINT;
+	VAR i: LONGINT; a: Basic.Integer4Byte; x: LONGINT;
+	BEGIN
+		FOR i := 0 TO LEN(a)-1 DO a[i] := char; Next END;
+		Basic.Decode4ByteInteger(a, x);
+		RETURN x
+	END Integer4;
+	
+	PROCEDURE Text(): Basic.String;
+	VAR a: ARRAY 16 OF CHAR; old, new: Basic.String; i, k, oldLen: LONGINT; x: CHAR;
+	BEGIN
+		x := char; Next; new := NIL; 
+		REPEAT
+			i := 0;
+			WHILE (i < LEN(a)) & (x # 0X) DO
+				a[i] := x; INC(i); x := char; Next
+			END;
+			old := new;
+			IF old # NIL THEN
+				NEW(new, LEN(old) + i);
+				FOR k := 0 TO LEN(old)-2 DO new[k] := old[k] END;
+				FOR k := 0 TO i - 1 DO new[LEN(old) - 1 + k] := a[k] END;
+				DELETE(old)
+			ELSE
+				NEW(new, i + 1);
+				FOR k := 0 TO i - 1 DO new[k] := a[k] END
+			END;
+			new[LEN(new)-1] := 0X
+		UNTIL x = 0X;
+		RETURN new
+	END Text;
+	
+BEGIN
+	usedInterfaces := NIL; usedComponents := NIL;
+	newInterfaces := NIL; newComponents := NIL; 
+	compilationUnits := NIL
+END ComLoader.
+

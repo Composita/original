@@ -1,0 +1,777 @@
+MODULE ComBasic; (** Component System, Basic Functionality, 2006 by Luc Blaeser *)
+	IMPORT SYSTEM, Output, Memory;
+	
+	CONST 
+		Pi* = 3.14159265358979323846E0;
+
+		InitListSize* = 4;
+	
+		NilValue* = Memory.Nil;
+	
+		FastAlignment = 64; (* performance optimization *)
+	
+	CONST
+		StatisticsEnabled* = TRUE;
+	
+	TYPE
+		Statistics* = RECORD
+			nofComponents*: LONGINT;
+			nofProcesses*: LONGINT;
+			nofTexts*: LONGINT;
+			nofCollections*: LONGINT;
+		END;
+	VAR
+		statistics*: Statistics;
+	
+	TYPE
+		String* = POINTER TO ARRAY OF CHAR;
+		
+		RawSection* = POINTER TO ARRAY OF CHAR;
+	
+		ObjectArray = POINTER TO ARRAY OF PTR;
+		
+		List* = OBJECT 
+			VAR
+				list : ObjectArray;
+				count : LONGINT;
+				multipleAllowed*: BOOLEAN;
+			
+			PROCEDURE &InitList*;
+			BEGIN NEW(list, InitListSize); count := 0; multipleAllowed := FALSE
+			END InitList;
+			
+			(** deletes contained elements *)
+			PROCEDURE Free*;
+			BEGIN DeleteAll; DELETE(list)
+			END Free;
+			
+			PROCEDURE Length*(): LONGINT;
+			BEGIN RETURN count
+			END Length;
+			
+			PROCEDURE Grow;
+			VAR old: ObjectArray; i: LONGINT;
+			BEGIN 
+				old := list; 
+				NEW(list, LEN(list)*2);
+				FOR i := 0 TO count-1 DO list[i] := old[i] END;
+				DELETE(old)
+			END Grow;
+		
+			PROCEDURE Add*(x: PTR);
+			BEGIN
+				ASSERT(x # NIL);
+				IF ~multipleAllowed THEN ASSERT(~Contains(x)) END; (* already contained *)
+				IF count = LEN(list) THEN Grow END;
+				list[count] := x;
+				INC(count)
+			END Add;
+			
+			PROCEDURE Replace*(x, y: PTR);
+			VAR i : LONGINT;
+			BEGIN 
+				i := IndexOf(x);
+				IF i >= 0 THEN list[i] := y END
+			END Replace;
+			
+			PROCEDURE ReplaceByIndex*(i: LONGINT; x: PTR);
+			BEGIN
+				IF (i >= 0) & (i < count) THEN
+					list[i] := x
+				ELSE HALT(101) (* out of boundaries *)
+				END
+			END ReplaceByIndex;
+			
+			(** If the object is not present, -1 is returned *)
+			PROCEDURE IndexOf*(x: PTR): LONGINT;
+			VAR i : LONGINT;
+			BEGIN 
+				i := 0 ; WHILE i < count DO IF list[i] = x THEN RETURN i END; INC(i) END;
+				RETURN -1
+			END IndexOf;
+			
+			PROCEDURE Contains*(x: PTR): BOOLEAN;
+			BEGIN RETURN IndexOf(x) # -1
+			END Contains;
+			
+			PROCEDURE Remove*(x : PTR);
+			VAR i: LONGINT;
+			BEGIN
+				i := 0; WHILE (i < count) & (list[i] # x) DO INC(i) END;
+				IF i < count THEN
+					WHILE (i < count-1) DO list[i] := list[i+1]; INC(i) END;
+					DEC(count); 
+					list[count] := NIL
+				END
+			END Remove;
+		
+			PROCEDURE Clear*;
+			VAR i: LONGINT;
+			BEGIN
+				FOR i := 0 TO count - 1 DO list[i] := NIL END;
+				count := 0
+			END Clear;
+			
+			PROCEDURE Delete*(index: LONGINT);
+			BEGIN ASSERT(index < count); DELETE(list[index])
+			END Delete;
+			
+			PROCEDURE DeleteAll*;
+			VAR i: LONGINT;
+			BEGIN
+				FOR i := 0 TO count - 1 DO 
+					DELETE(list[i]) 
+				END;
+				count := 0
+			END DeleteAll;
+			
+			PROCEDURE GetItem*(i: LONGINT): PTR;
+			BEGIN
+				IF (i < 0) OR (i >= count) THEN HALT(101) END;
+				RETURN list[i]	
+			END GetItem;
+		END List;
+						
+		StringArray = POINTER TO ARRAY OF String;
+		
+		StringList* = OBJECT 
+			VAR
+				list : StringArray;
+				count : LONGINT;
+				multipleAllowed*: BOOLEAN;
+			
+			(** initSize = 0 for default capacity *)
+			PROCEDURE &InitList*(initSize: LONGINT);
+			BEGIN
+				IF initSize <= 0 THEN initSize := InitListSize END;
+				NEW(list, initSize); count := 0; multipleAllowed := FALSE
+			END InitList;
+			
+			PROCEDURE Free*;
+			BEGIN DeleteAll; DELETE(list)
+			END Free;
+			
+			PROCEDURE Length*(): LONGINT;
+			BEGIN RETURN count
+			END Length;
+			
+			PROCEDURE Grow;
+			VAR old: StringArray; i: LONGINT;
+			BEGIN 
+				old := list; 
+				NEW(list, LEN(list)*2);
+				FOR i := 0 TO count-1 DO list[i] := old[i] END;
+				DELETE(old)
+			END Grow;
+		
+			PROCEDURE Add*(x: String);
+			BEGIN
+				ASSERT(x # NIL);
+				IF ~multipleAllowed THEN ASSERT(~Contains(x)) END; (* already contained *)
+				IF count = LEN(list) THEN Grow END;
+				list[count] := x;
+				INC(count)
+			END Add;
+			
+			PROCEDURE Replace*(x, y: String);
+			VAR i : LONGINT;
+			BEGIN 
+				i := IndexOf(x^);
+				IF i >= 0 THEN list[i] := y END
+			END Replace;
+			
+			PROCEDURE ReplaceByIndex*(i: LONGINT; x: String);
+			BEGIN
+				IF (i >= 0) & (i < count) THEN
+					list[i] := x
+				ELSE HALT(101) (* out of boundaries *)
+				END
+			END ReplaceByIndex;
+			
+			(** If the object is not present, -1 is returned *)
+			PROCEDURE IndexOf*(x: ARRAY OF CHAR): LONGINT;
+			VAR i : LONGINT;
+			BEGIN 
+				i := 0 ; WHILE i < count DO IF list[i]^ = x THEN RETURN i END; INC(i) END;
+				RETURN -1
+			END IndexOf;
+			
+			PROCEDURE Contains*(x: String): BOOLEAN;
+			BEGIN RETURN IndexOf(x^) # -1
+			END Contains;
+						
+			PROCEDURE Remove*(x : String);
+			VAR i: LONGINT;
+			BEGIN
+				i := 0; WHILE (i < count) & (list[i]^ # x^) DO INC(i) END;
+				IF i<count THEN 
+					WHILE (i < count-1) DO list[i] := list[i+1]; INC(i) END;
+					DEC(count); 
+					list[count] := NIL
+				END
+			END Remove;
+		
+			PROCEDURE Clear*;
+			VAR i: LONGINT;
+			BEGIN
+				FOR i := 0 TO count - 1 DO list[i] := NIL END;
+				count := 0
+			END Clear;
+			
+			PROCEDURE DeleteAll;
+			VAR i: LONGINT;
+			BEGIN
+				FOR i := 0 TO count -1 DO DELETE(list[i]) END;
+				count := 0
+			END DeleteAll;
+			
+			PROCEDURE GetString*(i: LONGINT): String;
+			BEGIN
+				IF (i < 0) OR (i >= count) THEN HALT(101) END;
+				RETURN list[i]	
+			END GetString;
+			
+			PROCEDURE Equal*(x: StringList): BOOLEAN;
+			VAR i: LONGINT; a, b: String;
+			BEGIN
+				IF Length() = x.Length() THEN
+					FOR i := 0 TO Length()-1 DO
+						a := GetString(i); b := x.GetString(i);
+						IF a^ # b^ THEN RETURN FALSE END
+					END;
+					RETURN TRUE
+				ELSE RETURN FALSE
+				END
+			END Equal;
+		END StringList;
+		
+		LongIntArray = POINTER TO ARRAY OF LONGINT;
+		
+		LongIntList* = OBJECT
+			VAR
+				list : LongIntArray;
+				count : LONGINT;
+				multipleAllowed*: BOOLEAN;
+			
+			PROCEDURE &InitList*;
+			BEGIN NEW(list, InitListSize); count := 0; multipleAllowed := FALSE
+			END InitList;
+
+			PROCEDURE Free*;
+			BEGIN DELETE(list)
+			END Free;
+
+			PROCEDURE Length*(): LONGINT;
+			BEGIN RETURN count
+			END Length;
+			
+			PROCEDURE Grow;
+			VAR old: LongIntArray; i: LONGINT;
+			BEGIN 
+				old := list; 
+				NEW(list, LEN(list)*2);
+				FOR i := 0 TO count-1 DO list[i] := old[i] END;
+				DELETE(old)
+			END Grow;
+
+			PROCEDURE Add*(x: LONGINT);
+			BEGIN
+				IF ~multipleAllowed THEN ASSERT(~Contains(x)) END; (* already contained *)
+				IF count = LEN(list) THEN Grow END;
+				list[count] := x;
+				INC(count)
+			END Add;
+			
+			PROCEDURE Replace*(x, y: LONGINT);
+			VAR i : LONGINT;
+			BEGIN 
+				i := IndexOf(x);
+				IF i >= 0 THEN list[i] := y END
+			END Replace;
+
+			PROCEDURE ReplaceByIndex*(i: LONGINT; x: LONGINT);
+			BEGIN
+				IF (i >= 0) & (i < count) THEN
+					list[i] := x
+				ELSE HALT(101) (* out of boundaries *)
+				END
+			END ReplaceByIndex;
+			
+			(** If the object is not present, -1 is returned *)
+			PROCEDURE IndexOf*(x: LONGINT): LONGINT;
+			VAR i : LONGINT;
+			BEGIN 
+				i := 0 ; WHILE i < count DO IF list[i] = x THEN RETURN i END; INC(i) END;
+				RETURN -1
+			END IndexOf;
+			
+			PROCEDURE Contains*(x: LONGINT): BOOLEAN;
+			BEGIN RETURN IndexOf(x) # -1
+			END Contains;
+			
+			PROCEDURE Remove*(x : LONGINT);
+			VAR i: LONGINT;
+			BEGIN
+				i := 0; WHILE (i < count) & (list[i] # x) DO INC(i) END;
+				IF i<count THEN 
+					WHILE (i < count-1) DO list[i] := list[i+1]; INC(i) END;
+					DEC(count); 
+					list[count] := 0
+				END
+			END Remove;
+
+			PROCEDURE Clear*;
+			VAR i: LONGINT;
+			BEGIN
+				FOR i := 0 TO count - 1 DO list[i] := 0 END;
+				count := 0
+			END Clear;
+			
+			PROCEDURE GetItem*(i: LONGINT): LONGINT;
+			BEGIN
+				IF (i < 0) OR (i >= count) THEN HALT(101) END;
+				RETURN list[i]	
+			END GetItem;
+			
+			PROCEDURE Equal*(x: LongIntList): BOOLEAN;
+			VAR i: LONGINT;
+			BEGIN
+				IF Length() = x.Length() THEN
+					FOR i := 0 TO Length()-1 DO
+						IF GetItem(i) # x.GetItem(i) THEN RETURN FALSE END
+					END;
+					RETURN TRUE
+				ELSE
+					RETURN FALSE
+				END
+			END Equal;
+		END LongIntList;
+					
+	CONST 
+		DataBlockSize = 32;
+	
+	TYPE
+		Integer4Byte* = ARRAY 4 OF CHAR;
+		Integer2Byte* = ARRAY 2 OF CHAR;
+	
+		DataBlock = OBJECT
+			VAR
+				next: DataBlock;
+				data: ARRAY DataBlockSize OF CHAR;
+		END DataBlock;
+
+		DataSequence* = OBJECT
+			VAR
+				length: LONGINT;
+				firstBlock, lastBlock: DataBlock;
+
+			PROCEDURE &InitDataSequence*;
+			BEGIN length := 0; NEW(firstBlock); lastBlock := firstBlock; firstBlock.next := NIL
+			END InitDataSequence;
+			
+			PROCEDURE Free*;
+			VAR p, q: DataBlock;
+			BEGIN
+				length := 0; 
+				lastBlock := NIL;
+				p := firstBlock; firstBlock := NIL;
+				WHILE p # NIL DO
+					q := p.next; p.next := NIL;
+					DELETE(p);
+					p := q; q := NIL
+				END
+			END Free;
+			
+			PROCEDURE Length*(): LONGINT;
+			BEGIN RETURN length
+			END Length;
+			
+			PROCEDURE LocalPos(): LONGINT;
+			VAR p: DataBlock;
+			BEGIN
+				IF (length > 0) & (length MOD DataBlockSize = 0) THEN
+					NEW(p); p.next := NIL; lastBlock.next := p; lastBlock := p
+				END;
+				RETURN length MOD DataBlockSize
+			END LocalPos;
+		
+			PROCEDURE Char*(x: CHAR);
+			VAR pos: LONGINT;
+			BEGIN pos := LocalPos(); lastBlock.data[pos] := x; INC(length)
+			END Char;
+			
+			PROCEDURE GetInternalPosition(pos: LONGINT; VAR block: DataBlock; VAR localOffset: LONGINT);
+			VAR p: DataBlock;
+			BEGIN
+				IF (pos < 0) OR (pos >= length) THEN HALT(105) (* invalid position *) END;
+				p := firstBlock;
+				WHILE pos >= DataBlockSize DO
+					p := p.next; DEC(pos, DataBlockSize)
+				END;
+				block := p; localOffset := pos
+			END GetInternalPosition;
+			
+			PROCEDURE ChangeChar*(pos: LONGINT; x: CHAR);
+			VAR block: DataBlock; offset: LONGINT;
+			BEGIN GetInternalPosition(pos, block, offset); block.data[offset] := x
+			END ChangeChar;
+			
+			PROCEDURE GetChar*(pos: LONGINT): CHAR;
+			VAR block: DataBlock; offset: LONGINT;
+			BEGIN GetInternalPosition(pos, block, offset); RETURN block.data[offset]
+			END GetChar;
+			
+			PROCEDURE GetInteger4*(pos: LONGINT): LONGINT;
+			VAR i: LONGINT; a: Integer4Byte; x: LONGINT;
+			BEGIN
+				FOR i := 0 TO LEN(a)-1 DO
+					a[i] := GetChar(pos + i)
+				END;
+				Decode4ByteInteger(a, x);
+				RETURN x
+			END GetInteger4;
+			
+			PROCEDURE GetInteger2*(pos: LONGINT): INTEGER;
+			VAR i: LONGINT; a: Integer2Byte; x: INTEGER;
+			BEGIN
+				FOR i := 0 TO LEN(a)-1 DO
+					a[i] := GetChar(pos + i)
+				END;
+				Decode2ByteInteger(a, x);
+				RETURN x
+			END GetInteger2;
+			
+			PROCEDURE Text*(a: ARRAY OF CHAR);
+			VAR i: LONGINT;
+			BEGIN
+				i := 0; WHILE (i < LEN(a)) & (a[i] # 0X) DO Char(a[i]); INC(i) END;
+				Char(0X)
+			END Text;
+			
+			PROCEDURE Integer1*(x: SHORTINT);
+			BEGIN Char(CHR(x))
+			END Integer1;
+			
+			PROCEDURE Integer2*(x: INTEGER);
+			VAR a: Integer2Byte; i: LONGINT;
+			BEGIN
+				Encode2ByteInteger(x, a);
+				FOR i := 0 TO LEN(a)-1 DO Char(a[i]) END
+			END Integer2;
+			
+			PROCEDURE Integer4*(x: LONGINT);
+			VAR a: Integer4Byte; i: LONGINT;
+			BEGIN
+				Encode4ByteInteger(x, a);
+				FOR i := 0 TO LEN(a)-1 DO Char(a[i]) END
+			END Integer4;
+			
+			PROCEDURE ChangeInteger4*(pos: LONGINT; x: LONGINT);
+			VAR a: Integer4Byte; i: LONGINT;
+			BEGIN
+				Encode4ByteInteger(x, a);
+				FOR i := 0 TO LEN(a)-1 DO ChangeChar(pos+i, a[i]) END
+			END ChangeInteger4;
+						
+			PROCEDURE GetRawSection*(): RawSection;
+			VAR b: DataBlock; i, k, m: LONGINT; section: RawSection; size: LONGINT;
+			BEGIN
+				size := length;
+				IF size MOD FastAlignment # 0 THEN INC(size, size - size MOD FastAlignment) END;
+				NEW(section, size);
+				b := firstBlock; 
+				i := 0;
+				FOR k := 0 TO (length DIV DataBlockSize)-1 DO
+					FOR m := 0 TO DataBlockSize-1 DO 
+						section[i] := b.data[m]; INC(i)
+					END;
+					b := b.next
+				END;
+				FOR m := 0 TO (length MOD DataBlockSize)-1 DO 
+					section[i] := b.data[m]; INC(i)
+				END;
+				RETURN section
+			END GetRawSection;
+		END DataSequence;
+		
+	VAR RandomZ: LONGINT;
+	
+	PROCEDURE RandomUniform*(): REAL;
+	CONST a = 16807; m = 2147483647; q = m DIV a; r = m MOD a;
+	VAR g: LONGINT;
+	BEGIN
+		g := a*(RandomZ MOD q) - r*(RandomZ DIV q);
+		IF g > 0 THEN RandomZ := g ELSE RandomZ := g + m END;
+		RETURN SHORT(RandomZ*1.0D0/m)	(* must compute this in double precision, e.g. (m-1)/m *)
+	END RandomUniform;
+	
+	PROCEDURE RandomInitSeed*(seed: LONGINT);
+	BEGIN RandomZ := seed
+	END RandomInitSeed;
+
+	PROCEDURE NewString*(name: ARRAY OF CHAR): String;
+	VAR str: String;
+	BEGIN NEW(str, Length(name)); COPY(name, str^); RETURN str
+	END NewString;
+	
+	PROCEDURE Length*(name: ARRAY OF CHAR): LONGINT;
+	VAR i: LONGINT;
+	BEGIN
+		i := 0; WHILE (i < LEN(name)) & (name[i] # 0X) DO INC(i) END;
+		IF i < LEN(name) THEN INC(i) END;
+		RETURN i
+	END Length;
+	
+	PROCEDURE CopyString*(x: String): String;
+	VAR y: String; i: LONGINT;
+	BEGIN NEW(y, LEN(x)); FOR i := 0 TO LEN(x)-1 DO y[i] := x[i] END; RETURN y
+	END CopyString;
+			
+	(** Standard Output *)
+																
+	PROCEDURE OutText*(text: ARRAY OF CHAR);
+	BEGIN Output.Text(text)
+	END OutText;
+		
+	PROCEDURE OutCharacter*(c: CHAR);
+	BEGIN Output.Character(c)
+	END OutCharacter;
+	
+	PROCEDURE OutInteger*(i: LONGINT);
+	BEGIN Output.Integer(i)
+	END OutInteger;
+	
+	PROCEDURE OutHexInt*(i: LONGINT);
+	BEGIN Output.Hex(i)
+	END OutHexInt;
+	
+	PROCEDURE OutCardinal*(i: CARDINAL);
+	BEGIN Output.Cardinal(i)
+	END OutCardinal;
+	
+	PROCEDURE OutHexCardinal*(i: CARDINAL);
+	BEGIN Output.HexCardinal(i)
+	END OutHexCardinal;
+	
+	PROCEDURE OutReal*(real: REAL);
+	VAR binExp, binSig, decExp, d, i, k: LONGINT; 
+	BEGIN 
+		binExp := ASH(SYSTEM.VAL(LONGINT, real), -23) MOD 256; (* bit 23..30 *)
+		DEC(binExp, 127); (* biased exponent *)
+		binSig := SYSTEM.VAL(LONGINT, real) MOD 800000H; (* bit 0..22 *)
+		(* ABS(real) = sig * 2^(exp) *)
+		IF binExp = 128 THEN (* NAN or INF *)
+			IF binSig # 0 THEN Output.Text("NAN")
+			ELSIF real < 0 THEN Output.Text("-INF")
+			ELSE Output.Text("INF")
+			END
+		ELSIF real = 0.0 THEN
+			Output.Text("0.0")
+		ELSE
+			IF real < 0.0 THEN 
+				Output.Character("-"); 
+				real := -real 
+			END;
+			decExp := 0; k := 0;
+			WHILE (real >= 10.0) & (k < 1000) DO
+				real := real / 10; INC(decExp); INC(k)
+			END; k := 0;
+			WHILE (real < 1.0) & (k < 1000) DO
+				real := real * 10; DEC(decExp); INC(k)
+			END;
+			d := ENTIER(real); ASSERT(d < 10);
+			Output.Integer(d);
+			Output.Character(".");
+			real := real - d; real := real * 10;
+			IF real = 0.0 THEN Output.Character("0") END;
+			i := 0;
+			WHILE (i < 7) & (real # 0.0) DO
+				d := ENTIER(real); ASSERT(d < 10);
+				Output.Integer(d);
+				real := real - d; real := real * 10;
+				INC(i)
+			END;
+			Output.Character("E");
+			Output.Integer(decExp)
+		END
+	END OutReal;
+	
+	PROCEDURE OutLine*;
+	BEGIN Output.Line
+	END OutLine;
+	
+	PROCEDURE IntegerToText*(i: LONGINT; VAR s: ARRAY OF CHAR);
+	VAR j, k: LONGINT; digits: ARRAY 10 OF LONGINT;
+	BEGIN
+		IF (i = MIN(LONGINT)) THEN COPY("-2147483648", s)
+		ELSE
+			IF (i < 0) THEN i := -i; s[0] := "-"; j := 1
+			ELSE j := 0
+			END;		
+			k := 0; digits[k] := 0;
+			WHILE (i > 0) DO
+				digits[k] := i MOD 10; i := i DIV 10;
+				INC(k)
+			END;
+			IF (k > 0) THEN DEC(k) END; (* no leading "0" *)
+			WHILE (k >= 0) DO
+				s[j] := CHR(digits[k] + ORD("0"));
+				INC(j); DEC(k)
+			END;
+			s[j] := 0X
+		END		
+	END IntegerToText;
+	
+	PROCEDURE TextToInteger*(text: ARRAY OF CHAR; VAR val: LONGINT);
+	VAR i, d: LONGINT; neg: BOOLEAN;
+	BEGIN
+		i := 0;
+		neg := FALSE; 
+		IF text[i] = "+" THEN INC(i)
+		ELSIF text[i] = "-" THEN neg := TRUE; INC(i)
+		END;
+		val := 0;
+		WHILE (text[i] >= "0") & (text[i] <= "9") DO
+			d := ORD(text[i])-ORD("0");
+			IF (val <= ((MAX(LONGINT)-d) DIV 10)) THEN val := 10*val + d
+			ELSIF neg & (val = MAX(LONGINT) DIV 10) & (d = 8) & ((text[i] < "0") OR (text[i] > "9")) THEN
+				val := MIN(LONGINT); neg := FALSE
+			ELSE
+				HALT(100)
+			END;
+			INC(i)
+		END;
+		IF neg THEN val := -val END
+	END TextToInteger;
+	
+	PROCEDURE IntegerToHexText*(h: LONGINT; VAR s: ARRAY OF CHAR);
+	VAR c: CHAR; width: LONGINT;
+	BEGIN
+		width := 8;
+		s[width+1] := 0X;
+		WHILE (width >= 0) DO
+			c := CHR(h MOD 10H + ORD("0"));
+			IF (c > "9") THEN c := CHR((h MOD 10H - 10) + ORD("A")) END;
+			s[width] := c; h := h DIV 10H; DEC(width)
+		END
+	END IntegerToHexText;
+			
+	PROCEDURE IsPowerOf2*(x: LONGINT): BOOLEAN;
+	BEGIN
+		IF x < 0 THEN RETURN FALSE
+		ELSE
+			WHILE x > 1 DO
+				IF x MOD 2 = 0 THEN x := x DIV 2
+				ELSE RETURN FALSE
+				END
+			END;
+			RETURN TRUE
+		END
+	END IsPowerOf2;
+	
+	PROCEDURE LogarithmBasis2*(x: LONGINT): SHORTINT;
+	VAR i: SHORTINT;
+	BEGIN
+		ASSERT(x >= 0);
+		i := 0;
+		WHILE x > 1 DO
+			IF x MOD 2 = 0 THEN INC(i); x := x DIV 2
+			ELSE HALT(104) (* x is not a power of 2 *)
+			END
+		END;
+		RETURN i
+	END LogarithmBasis2;
+	
+	PROCEDURE BitMaskWithLowerSetBits*(bits: SHORTINT): LONGINT;
+	VAR k, m, x: LONGINT;
+	BEGIN
+		x := 0; m := 1;
+		FOR k := 1 TO bits DO INC(x, m); m := m*2 END;
+		RETURN x
+	END BitMaskWithLowerSetBits;
+	
+	PROCEDURE BitMask*(bits: SET): LONGINT;
+	BEGIN RETURN SYSTEM.VAL(LONGINT, bits)
+	END BitMask;
+		
+	PROCEDURE Encode2ByteInteger*(x: INTEGER; VAR a: Integer2Byte);
+	VAR i: LONGINT;
+	BEGIN FOR i := 0 TO LEN(a)-1 DO a[i] := CHR(x MOD 100H); x := SYSTEM.LSH(x, -8) END
+	END Encode2ByteInteger;
+	
+	PROCEDURE Decode2ByteInteger*(a: Integer2Byte; VAR x: INTEGER);
+	VAR i: LONGINT;
+	BEGIN x := 0; FOR i := LEN(a)-1 TO 0 BY -1 DO x := SYSTEM.LSH(x, 8) + ORD(a[i]) END
+	END Decode2ByteInteger;
+	
+	PROCEDURE Encode4ByteInteger*(x: LONGINT; VAR a: Integer4Byte);
+	VAR i: LONGINT;
+	BEGIN FOR i := 0 TO LEN(a)-1 DO a[i] := CHR(x MOD 100H); x := SYSTEM.LSH(x, -8) END
+	END Encode4ByteInteger;
+	
+	PROCEDURE Decode4ByteInteger*(a: Integer4Byte; VAR x: LONGINT);
+	VAR i: LONGINT;
+	BEGIN x := 0; FOR i := LEN(a)-1 TO 0 BY -1 DO x := SYSTEM.LSH(x, 8) + ORD(a[i]) END
+	END Decode4ByteInteger;
+	
+	PROCEDURE EncodeReal*(x: REAL): LONGINT;
+	BEGIN RETURN SYSTEM.VAL(LONGINT, x)
+	END EncodeReal;
+	
+	PROCEDURE -Arctan*(x: REAL): REAL;
+	CODE {SYSTEM.i386, SYSTEM.FPU}
+		DB 0D9H, 004H, 024H	(* FLD [ESP] *)
+		DB 0D9H, 0E8H	(* FLD1 *)
+		DB 0D9H, 0F3H	(* FPATAN ST(1)/ST(0) *)
+		DB 058H	(* POP EAX *)
+	END Arctan;
+	
+	PROCEDURE -Sqrt*(x: REAL): REAL;
+	CODE {SYSTEM.i386, SYSTEM.FPU}
+		DB 0D9H, 004H, 024H	(* FLD [ESP] *)
+		DB 0D9H, 0FAH	(* FSQRT ST(0) *)
+		DB 058H	(* POP EAX *)
+	END Sqrt;
+	
+	PROCEDURE -AtomicInc*(VAR x: LONGINT);
+	CODE {SYSTEM.i386}
+		POP EAX	; ADR(x)
+		LOCK
+		INC DWORD [EAX]
+	END AtomicInc;
+	
+	PROCEDURE -AtomicDec*(VAR x: LONGINT);
+	CODE {SYSTEM.i386}
+		POP EAX	; ADR(x)
+		LOCK
+		DEC DWORD [EAX]
+	END AtomicDec;
+	
+	PROCEDURE -AtomicIncByAdr*(adr: Memory.Address);
+	CODE {SYSTEM.i386}
+		POP EAX	; ADR(x)
+		LOCK
+		INC DWORD [EAX]
+	END AtomicIncByAdr;
+	
+	PROCEDURE -AtomicDecByAdr*(adr: Memory.Address);
+	CODE {SYSTEM.i386}
+		POP EAX	; ADR(x)
+		LOCK
+		DEC DWORD [EAX]
+	END AtomicDecByAdr;
+	
+	PROCEDURE -IncreaseByAddress*(adr: Memory.Address);
+	CODE {SYSTEM.i386}
+		POP EAX
+		INC DWORD 0[EAX] 
+	END IncreaseByAddress;
+	
+	PROCEDURE -DecreaseByAddress*(adr: Memory.Address);
+	CODE {SYSTEM.i386}
+		POP EAX
+		DEC DWORD 0[EAX] 
+	END DecreaseByAddress;
+
+BEGIN RandomInitSeed(1344)
+END ComBasic.

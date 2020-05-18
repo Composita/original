@@ -2,7 +2,8 @@
 
 This repo contains documents and code beloning to the original Composita language.
 
-The resources can also be found on the original [Composita](https://concurrency.ch/Research/Composita) website.
+The examples can also be found on the original [Composita](https://concurrency.ch/Research/Composita) website.
+The package has been copied directly from the virtual machine found on the same site.
 
 ## License
 
