@@ -91,7 +91,7 @@ Expression        := [ AttributeList ]
                      (
                        SimpleExpr [ ( "=" | "#" | "<" | "<=" | ">" | ">=" ) SimpleExpr ]
                        | Designator ( "OFFERS" | "REQUIRES" ) InterfaceDeclList
-                       | Designator "IS" "TYPE"
+                       | Designator "IS" Type
                      ). 
 SimpleExpr        := [ "+" | "~" ] Term { ( "+" | "-" | "OR" ) Term }.
 Term              := Factor { ( "*" | "/" | "DIV" | "MOD" | "AND" ) Factor }.
