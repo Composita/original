@@ -12,7 +12,7 @@ NofInterfaces     := Integer [ ".." ( Integer | "*" ) ].
 Interface         := "INTERFACE" Identifier ";"
                        Protocol
                      "END" Identifier ";".
-Protocol          := [ ProtocolExpression ].
+Protocol          := [ ProtocolExpr ].
 ProtocolExpr      := ProtocolTerm { "|" ProtocolTerm }.
 ProtocolTerm      := ProtocolFactor { ProtocolFactor }.
 ProtocolFactor    := MessageDecl
@@ -89,11 +89,11 @@ ExpressionList    := Expression { "," Expression }.
 ConstantExpr      := Expression.
 Expression        := [ AttributeList ]
                      (
-                       SimpleExpr [ ( "=" | "#" | "<" | "<=" | ">" | ">=" ) ] SimpleExpr
+                       SimpleExpr [ ( "=" | "#" | "<" | "<=" | ">" | ">=" ) SimpleExpr ]
                        | Designator ( "OFFERS" | "REQUIRES" ) InterfaceDeclList
                        | Designator "IS" "TYPE"
                      ). 
-SimpleExpr        := [ "+" | "-" ] Term { ( "+" | "-" | "OR" ) Term }.
+SimpleExpr        := [ "+" | "~" ] Term { ( "+" | "-" | "OR" ) Term }.
 Term              := Factor { ( "*" | "/" | "DIV" | "MOD" | "AND" ) Factor }.
 Factor            := Operand | "-" Factor | "(" Expression ")".
 Operand           := Number | ConstChar | Text | Designator
