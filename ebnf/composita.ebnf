@@ -71,6 +71,7 @@ Return            := "RETURN" [ Expression ].
 If                := "IF" Expression "THEN" StatementSeq
                      { "ELSEIF" Expression "THEN" StatementSeq }
                      [ "ELSE" StatementSeq ]
+                     "END".
 While             := "WHILE" Expression "DO"
                        StatementSeq
                      "END".
